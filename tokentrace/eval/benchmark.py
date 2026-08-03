@@ -58,8 +58,13 @@ def train_engine(
     # that will be evaluated — otherwise the black-box missingness signature is never
     # fit and transform() falls back to a WHITE-fit map (the miscalibration this is
     # meant to prevent).
-    cal_tiers = [Tier.WHITE, Tier.GREY, Tier.BLACK]
+    # `with_tier` can only DOWN-cap, so asking a black-box handle for WHITE silently
+    # returns black — three identical passes whose duplicates then inflate counts
+    # against Calibrator.min_samples. Derive the schedule from the handle's real
+    # ceiling and de-duplicate the records.
+    cal_tiers = [t for t in (Tier.WHITE, Tier.GREY, Tier.BLACK) if t <= model.tier] or [model.tier]
     records = []
+    seen_rec: set = set()
     for li in cal:
         for t in cal_tiers:
             fv = pipeline.run(li.inference, model.with_tier(t))
@@ -69,20 +74,31 @@ def train_engine(
             for m in ALL_MODES:
                 if z[m] <= _MASK:            # masked (non-RAG) — nothing to calibrate
                     continue
+                key = (m.value, sig, round(z[m], 6), yv[m])
+                if key in seen_rec:
+                    continue
+                seen_rec.add(key)
                 records.append({"mode": m, "signature": sig, "z": z[m], "label": yv[m]})
     calibrator = Calibrator().fit(records)
     engine.calibrator = calibrator
 
     # 3) fit conformal on the cal split across the same tiers (tau must reflect the
-    # flatter black-box probability distribution too, not just WHITE).
+    # flatter black-box probability distribution too, not just WHITE), de-duplicated
+    # so identical tier passes cannot weight the quantile.
     prob_rows, gps = [], []
+    seen_prob: set = set()
     for li in cal:
         gp = gold_primary(li)
         if gp is None:
             continue
         for t in cal_tiers:
             fv = pipeline.run(li.inference, model.with_tier(t))
-            prob_rows.append(engine.probabilities(fv, li.inference))
+            probs = engine.probabilities(fv, li.inference)
+            key = (gp.value, tuple(round(probs[m], 6) for m in ALL_MODES))
+            if key in seen_prob:
+                continue
+            seen_prob.add(key)
+            prob_rows.append(probs)
             gps.append(gp)
     engine.conformal = ConformalPredictor().fit(prob_rows, gps)
 

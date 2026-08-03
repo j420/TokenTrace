@@ -27,9 +27,18 @@ from tokentrace.signals.registry import SignalPipeline, default_extractors
 _TIERS = (Tier.WHITE, Tier.GREY, Tier.BLACK)
 
 
-def _ece(engine: DiagnosisEngine, test, model, pipeline, tier=Tier.WHITE,
-         n_bins: int = 10, calibrated: bool = True) -> float:
-    """Expected calibration error over all (example, mode) probabilities."""
+def _ece_full(engine: DiagnosisEngine, test, model, pipeline, tier=Tier.WHITE,
+              n_bins: int = 10, calibrated: bool = True) -> dict:
+    """Expected calibration error over all (example, mode) probabilities.
+
+    Uses EQUAL-MASS (quantile) bins rather than fixed-width ones, and additionally
+    reports how much probability mass is actually *interior* (0.1 < p < 0.9).
+
+    Why that matters: on a separable corpus the residual head saturates, so every
+    probability sits at 0 or 1 and fixed-width ECE degenerates into a rescaled error
+    rate — a number that looks like calibration evidence but carries none. Reporting
+    ``interior_frac`` alongside makes that degeneracy visible instead of quotable.
+    """
     confs: list[float] = []
     labels: list[int] = []
     for li in test:
@@ -44,16 +53,26 @@ def _ece(engine: DiagnosisEngine, test, model, pipeline, tier=Tier.WHITE,
             confs.append(probs[m])
             labels.append(yv[m])
     n = len(confs)
+    if n == 0:
+        return {"ece": 0.0, "interior_frac": 0.0, "n": 0}
+
+    order = sorted(range(n), key=lambda i: confs[i])
     ece = 0.0
+    edges = [round(b * n / n_bins) for b in range(n_bins + 1)]
     for b in range(n_bins):
-        lo, hi = b / n_bins, (b + 1) / n_bins
-        idx = [i for i, c in enumerate(confs) if (lo < c <= hi) or (b == 0 and c <= 0.0)]
+        idx = order[edges[b]:edges[b + 1]]
         if not idx:
             continue
         acc = sum(labels[i] for i in idx) / len(idx)
         conf = sum(confs[i] for i in idx) / len(idx)
         ece += (len(idx) / n) * abs(acc - conf)
-    return round(ece, 4)
+    interior = sum(1 for c in confs if 0.1 < c < 0.9) / n
+    return {"ece": round(ece, 4), "interior_frac": round(interior, 4), "n": n}
+
+
+def _ece(engine, test, model, pipeline, tier=Tier.WHITE, n_bins: int = 10,
+         calibrated: bool = True) -> float:
+    return _ece_full(engine, test, model, pipeline, tier, n_bins, calibrated)["ece"]
 
 
 def run_ablations(model: ModelHandle, dataset=None, pipeline: Optional[SignalPipeline] = None,
@@ -62,7 +81,13 @@ def run_ablations(model: ModelHandle, dataset=None, pipeline: Optional[SignalPip
     dataset = dataset if dataset is not None else build_dataset(model, pipeline, seeds=seeds)
     train, cal, test = split_dataset(dataset)
 
-    full = train_engine(train, cal, model, pipeline)
+    # Use the SAME family-dropout tier schedule as train_and_evaluate: `ablate` and
+    # `eval` were training differently while the docs presented them as
+    # interchangeable, so their per-tier tables disagreed and a reader running the
+    # other command saw different numbers.
+    cycle = [Tier.WHITE, Tier.GREY, Tier.BLACK]
+    train_tiers = [cycle[i % 3] for i in range(len(train))]
+    full = train_engine(train, cal, model, pipeline, train_tiers=train_tiers)
 
     # 1. rules-only (cold-start: residual 0, no calibration/conformal fit) vs full
     rules_only = DiagnosisEngine(recommender=Recommender(model=model))
@@ -74,18 +99,33 @@ def run_ablations(model: ModelHandle, dataset=None, pipeline: Optional[SignalPip
     # 2. per-tier curves (full engine)
     per_tier = {t.label: evaluate(full, test, model, t, pipeline).as_dict() for t in _TIERS}
 
-    # 3. per-family ablation — drop each family's extractors, evaluate at white-box
-    per_family = {}
+    # 3. per-family ablation. TWO distinct experiments — conflating them is what made
+    #    the previous "which family is load-bearing" claim an artifact:
+    #    (a) RETRAINED leave-one-family-out = the family's INFORMATION contribution.
+    #    (b) missing-signal robustness = keep the full model, NaN out one family at
+    #        inference = how the shipped engine copes when a family drops out live.
+    per_family_retrained = {}
+    per_family_robustness = {}
     for fam in (SignalFamily.PROMPT, SignalFamily.RETRIEVAL,
                 SignalFamily.MECHANISTIC, SignalFamily.CONFIDENCE):
         kept = [ex for ex in default_extractors() if ex.family != fam]
-        per_family[fam.value] = evaluate(full, test, model, Tier.WHITE,
-                                         SignalPipeline(kept)).as_dict()
+        reduced = SignalPipeline(kept)
+        per_family_robustness[fam.value] = evaluate(full, test, model, Tier.WHITE,
+                                                    reduced).as_dict()
+        refit = train_engine(train, cal, model, reduced)
+        per_family_retrained[fam.value] = evaluate(refit, test, model, Tier.WHITE,
+                                                   reduced).as_dict()
 
-    # 4. calibration ECE
+    # 4. calibration ECE (with the interior-mass caveat attached to the number)
+    unc = _ece_full(full, test, model, pipeline, calibrated=False)
+    cal_ = _ece_full(full, test, model, pipeline, calibrated=True)
     calibration = {
-        "ece_uncalibrated": _ece(full, test, model, pipeline, calibrated=False),
-        "ece_calibrated": _ece(full, test, model, pipeline, calibrated=True),
+        "ece_uncalibrated": unc["ece"],
+        "ece_calibrated": cal_["ece"],
+        # Fraction of probabilities strictly inside (0.1, 0.9). Near 0 means the
+        # scores are saturated and ECE is only a rescaled error rate — so the ECE
+        # figure carries no calibration information and must not be quoted as such.
+        "interior_mass_fraction": cal_["interior_frac"],
     }
 
     # 5. conformal coverage vs set size, per tier (already in per_tier metrics)
@@ -96,22 +136,40 @@ def run_ablations(model: ModelHandle, dataset=None, pipeline: Optional[SignalPip
         "sizes": {"train": len(train), "cal": len(cal), "test": len(test)},
         "ablation_learned_head": ablation_learned,
         "per_tier": per_tier,
-        "per_family_dropped": per_family,
+        "per_family_retrained": per_family_retrained,
+        "per_family_robustness": per_family_robustness,
         "calibration": calibration,
         "conformal": conformal,
     }
 
 
 #: Continuous signal features that a real estimator (NLI, embeddings, a classifier,
-#: attention readouts) would produce with observation noise. Structural counts
-#: (n_chunks, lengths, multihop flag) are exact and left alone.
-_NOISY_FEATURES = {
-    "prompt_ambiguity", "answer_supported_by_context", "max_chunk_relevance",
-    "mean_chunk_relevance", "gold_position_frac", "gold_recall_in_context",
-    "semantic_entropy", "self_consistency", "mean_token_entropy", "max_token_entropy",
-    "context_attention_ratio", "gold_attention_ratio", "logit_lens_answer_layer",
-    "logit_lens_stability", "external_context_score", "parametric_knowledge_score",
-    "gold_patch_effect",
+#: attention readouts) would produce with observation noise, mapped to the range each
+#: one is actually defined on. Structural counts (n_chunks, lengths, multihop flag)
+#: are exact and left alone.
+#:
+#: The range matters: a blanket clamp to [0, 1.5] truncated the token entropies
+#: (natural max ~1.9 nats here) and FLOORED gold_patch_effect, which is signed — a
+#: negative causal effect is meaningful and was being silently destroyed.
+_INF = float("inf")
+_NOISY_FEATURES: dict[str, tuple[float, float]] = {
+    "prompt_ambiguity": (0.0, 1.0),
+    "answer_supported_by_context": (0.0, 1.0),
+    "max_chunk_relevance": (0.0, 1.0),
+    "mean_chunk_relevance": (0.0, 1.0),
+    "gold_position_frac": (0.0, 1.0),
+    "gold_recall_in_context": (0.0, 1.0),
+    "semantic_entropy": (0.0, 1.0),
+    "self_consistency": (0.0, 1.0),
+    "mean_token_entropy": (0.0, _INF),
+    "max_token_entropy": (0.0, _INF),
+    "context_attention_ratio": (0.0, 1.0),
+    "gold_attention_ratio": (0.0, 1.0),
+    "logit_lens_answer_layer": (0.0, 1.0),
+    "logit_lens_stability": (0.0, 1.0),
+    "external_context_score": (0.0, 1.0),
+    "parametric_knowledge_score": (0.0, 1.0),
+    "gold_patch_effect": (-_INF, _INF),
 }
 
 
@@ -124,6 +182,11 @@ class NoisyPipeline:
     def __init__(self, base: SignalPipeline, sigma: float):
         self.base = base
         self.sigma = sigma
+        # Draw counter: keying the perturbation on (feature, prompt) ALONE made it a
+        # fixed deterministic bias — the same row always got the same offset, so
+        # re-observing an inference could never vary. Including the draw index makes
+        # it genuine per-observation estimator noise while staying reproducible.
+        self._draw = 0
 
     def run(self, inference, model):
         from tokentrace.models.mock import _seeded_unit
@@ -131,12 +194,17 @@ class NoisyPipeline:
         fv = self.base.run(inference, model)
         if self.sigma <= 0:
             return fv
+        self._draw += 1
         p = inference.prompt
         for name in list(fv.values):
-            if name in _NOISY_FEATURES:
-                u = _seeded_unit("fnoise", name, p)
-                fv.values[name] = min(1.5, max(0.0, fv.values[name] + self.sigma * (2 * u - 1) * 0.4))
-        if fv.has("is_correct") and _seeded_unit("flip", p) < self.sigma * 0.2:
+            rng = _NOISY_FEATURES.get(name)
+            if rng is None:
+                continue
+            lo, hi = rng
+            u = _seeded_unit("fnoise", name, p, self._draw)
+            val = fv.values[name] + self.sigma * (2 * u - 1) * 0.4
+            fv.values[name] = min(hi, max(lo, val))
+        if fv.has("is_correct") and _seeded_unit("flip", p, self._draw) < self.sigma * 0.2:
             fv.values["is_correct"] = 1.0 - fv.values["is_correct"]
         return fv
 
@@ -158,10 +226,16 @@ def run_robustness(
     dataset = build_dataset(model, pipeline, seeds=seeds)   # clean labels
     train, cal, test = split_dataset(dataset)
 
+    # Same family-dropout training schedule as run_ablations / train_and_evaluate, so
+    # the three entry points are genuinely comparable (they previously trained
+    # differently while the docs presented their tables as interchangeable).
+    cycle = [Tier.WHITE, Tier.GREY, Tier.BLACK]
+    train_tiers = [cycle[i % 3] for i in range(len(train))]
+
     out = {}
     for nz in noise_levels:
         noisy = NoisyPipeline(pipeline, nz)
-        engine = train_engine(train, cal, model, noisy)
+        engine = train_engine(train, cal, model, noisy, train_tiers=train_tiers)
         met = evaluate(engine, test, model, Tier.WHITE, noisy).as_dict()
         out[f"{nz:.2f}"] = {
             "diagnosis_accuracy": met["diagnosis_accuracy"],
