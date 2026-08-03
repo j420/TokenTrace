@@ -34,7 +34,11 @@ optional accelerator for one tier only (see [CPU-first](#cpu-first-no-gpu-requir
 pip install -e .            # dependency-light CPU core (numpy, scikit-learn, lightgbm)
 tokentrace demo             # train on the offline synthetic corpus + diagnose 5 scenarios
 tokentrace eval             # train + evaluate against the proposal's targets
+tokentrace ablate           # ablation studies (learned head, per-family, calibration)
 ```
+
+Full write-up of methodology, results, ablations, and honest caveats:
+[`docs/REPORT.md`](docs/REPORT.md).
 
 ```text
 === retrieval failure ===
