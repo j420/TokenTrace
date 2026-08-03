@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Caches / artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tokentrace_cache/
+*.npz
+*.faiss
+
+# Models & data (never commit large binaries)
+models/*.gguf
+models/**/*.safetensors
+models/**/*.bin
+data/raw/
+data/cache/
+*.parquet
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
