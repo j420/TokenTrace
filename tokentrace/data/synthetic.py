@@ -33,7 +33,8 @@ def build_dataset(
     for s in seeds:
         for fact in FACTS:
             for recipe in (harness.clean, harness.retrieval_failure, harness.context_dilution,
-                           harness.prompt_ambiguity, harness.hallucination):
+                           harness.prompt_ambiguity, harness.hallucination,
+                           harness.hallucination_override):
                 li = recipe(fact, seed=s)
                 if li is not None:
                     out.append(li)

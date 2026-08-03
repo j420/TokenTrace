@@ -13,6 +13,7 @@ headline evaluation.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Optional
 
 from tokentrace.core.types import (
@@ -31,21 +32,51 @@ M = FailureMode
 _POOL = distractor_pool()
 
 
-def _filler_chunks(n: int, avoid: str, start: int = 0) -> list[Chunk]:
-    """n topical hard-negative chunks (deterministic), none bearing the answer."""
+def _u(*parts: object) -> float:
+    """Deterministic float in [0,1) from arbitrary parts.
+
+    Used instead of an RNG so a corpus is byte-reproducible across runs while still
+    varying per (recipe, fact, seed).
+    """
+    h = hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()
+    return int(h[:8], 16) / 0x100000000
+
+
+def _pick(lo: int, hi: int, *key: object) -> int:
+    """Deterministic integer in [lo, hi]."""
+    return lo + int(_u(*key) * (hi - lo + 1))
+
+
+def _filler_chunks(n: int, avoid: str, start: int = 0, sents: int = 2) -> list[Chunk]:
+    """n topical hard-negative chunks (deterministic), none bearing the answer.
+
+    ``sents`` controls how many pool sentences are concatenated per chunk, which is
+    what lets callers vary CONTEXT LENGTH independently of CHUNK COUNT — see the
+    anti-shortcut note on :class:`InjectionHarness`. Texts are de-duplicated so a
+    chunk list never contains the same string under two source ids.
+    """
     avoid_toks = set(norm(avoid))
     picks: list[Chunk] = []
+    seen: set[str] = set()
     i = start
     guard = 0
-    while len(picks) < n and guard < len(_POOL) * 3:
-        a = _POOL[i % len(_POOL)]
-        b = _POOL[(i + 3) % len(_POOL)]
-        text = f"{a} {b}"
-        if not (avoid_toks & set(norm(text))):  # ensure it does not leak the answer
+    limit = len(_POOL) * 6
+    while len(picks) < n and guard < limit:
+        parts = [_POOL[(i + 5 * j) % len(_POOL)] for j in range(max(1, sents))]
+        text = " ".join(parts)
+        if text not in seen and not (avoid_toks & set(norm(text))):
+            seen.add(text)
             picks.append(Chunk(text=text, retriever_score=0.4, source_id=f"neg{i}", gold=False))
         i += 1
         guard += 1
     return picks
+
+
+def _place(gold: Chunk, fillers: list[Chunk], pos_frac: float) -> list[Chunk]:
+    """Insert ``gold`` into ``fillers`` at the given fractional position."""
+    idx = int(round(pos_frac * len(fillers)))
+    idx = max(0, min(len(fillers), idx))
+    return [*fillers[:idx], gold, *fillers[idx:]]
 
 
 def _v(fv, name: str, default: float) -> float:
@@ -80,15 +111,31 @@ class InjectionHarness:
     # Recipes
     # ------------------------------------------------------------------ #
     def clean(self, fact: Fact, seed: int = 0) -> Optional[LabeledInference]:
-        gold = Chunk(fact.gold_fact, 0.95, "gold", gold=True)
-        chunks = [gold, *_filler_chunks(2, fact.answer, seed)]
-        inf = Inference(
-            prompt=f"{fact.question}\n" + " ".join(c.text for c in chunks),
-            generated_answer="", retrieved_context=chunks, ground_truth=[fact.answer],
-            question=fact.question,
-            meta={"_sim": {"answer": fact.answer, "gold_fact": fact.gold_fact,
-                           "parametric": fact.parametric}},
-        )
+        # ~1/4 of clean rows are NON-RAG (correct parametric recall, no context) so
+        # that n_chunks == 0 does not uniquely identify the hallucination class.
+        non_rag = fact.parametric and _u("clean_nonrag", fact.question, seed) < 0.25
+        if non_rag:
+            inf = Inference(
+                prompt=fact.question, generated_answer="", retrieved_context=None,
+                ground_truth=[fact.answer], question=fact.question,
+                meta={"_sim": {"answer": fact.answer, "gold_fact": fact.gold_fact,
+                               "parametric_known": True}},
+            )
+        else:
+            gold = Chunk(fact.gold_fact, 0.95, "gold", gold=True)
+            n = _pick(2, 11, "clean_n", fact.question, seed)
+            # short fillers keep the total under the dilution threshold, so a clean
+            # row can carry MANY chunks and still be answered correctly.
+            fillers = _filler_chunks(n, fact.answer, seed, sents=1)
+            pos = _u("clean_pos", fact.question, seed)
+            chunks = _place(gold, fillers, pos)
+            inf = Inference(
+                prompt=f"{fact.question}\n" + " ".join(c.text for c in chunks),
+                generated_answer="", retrieved_context=chunks, ground_truth=[fact.answer],
+                question=fact.question,
+                meta={"_sim": {"answer": fact.answer, "gold_fact": fact.gold_fact,
+                               "parametric": fact.parametric}},
+            )
 
         def gate(fv):
             ic = _v(fv, "is_correct", 0.0)
@@ -98,7 +145,10 @@ class InjectionHarness:
 
     def retrieval_failure(self, fact: Fact, seed: int = 0,
                           parametric_recovery: bool = False) -> Optional[LabeledInference]:
-        chunks = _filler_chunks(3, fact.answer, seed)  # gold removed, hard negatives only
+        # gold removed, hard negatives only; count and length vary per row.
+        n = _pick(2, 11, "ret_n", fact.question, seed, parametric_recovery)
+        sents = _pick(1, 3, "ret_len", fact.question, seed)
+        chunks = _filler_chunks(n, fact.answer, seed, sents=sents)
         inf = Inference(
             prompt=f"{fact.question}\n" + " ".join(c.text for c in chunks),
             generated_answer="", retrieved_context=chunks, ground_truth=[fact.answer],
@@ -122,11 +172,24 @@ class InjectionHarness:
         return self._finalize(inf, [M.RETRIEVAL_FAILURE, M.HALLUCINATION],
                               [(M.RETRIEVAL_FAILURE, M.HALLUCINATION)], "retrieval_failure", gate)
 
-    def context_dilution(self, fact: Fact, seed: int = 0, n_distractors: int = 10) -> Optional[LabeledInference]:
-        fillers = _filler_chunks(n_distractors, fact.answer, seed)
+    def context_dilution(self, fact: Fact, seed: int = 0,
+                         n_distractors: Optional[int] = None) -> Optional[LabeledInference]:
+        # Dilution IS causally geometric (lost-in-the-middle), so it legitimately
+        # correlates with context shape — but the count still varies per row, and it
+        # overlaps the other recipes' range, so shape alone cannot separate the rest.
+        if n_distractors is None:
+            n_distractors = _pick(6, 13, "dil_n", fact.question, seed)
+        # Scale filler LENGTH to the chunk count so the context reliably clears the
+        # lost-in-the-middle token threshold at every count. Previously a fixed
+        # length left the low end of the range ~134 tokens — just under the 150-token
+        # trigger — so 10/64 dilution rows were silently discarded by their own gate.
+        # Scaling length (not raising the count floor) keeps n_chunks overlapping the
+        # other recipes, which is what prevents a shape shortcut.
+        sents = max(3, -(-240 // (8 * max(1, n_distractors))))
+        fillers = _filler_chunks(n_distractors, fact.answer, seed, sents=sents)
         gold = Chunk(fact.gold_fact, 0.6, "gold", gold=True)
-        mid = len(fillers) // 2
-        chunks = fillers[:mid] + [gold] + fillers[mid:]           # gold buried in the middle
+        pos = 0.3 + 0.4 * _u("dil_pos", fact.question, seed)   # buried in the middle third
+        chunks = _place(gold, fillers, pos)
         inf = Inference(
             prompt=f"{fact.question}\n" + " ".join(c.text for c in chunks),
             generated_answer="", retrieved_context=chunks, ground_truth=[fact.answer],
@@ -142,16 +205,24 @@ class InjectionHarness:
         return self._finalize(inf, [M.CONTEXT_DILUTION], [], "context_dilution", gate)
 
     def prompt_ambiguity(self, fact: Fact, seed: int = 0) -> Optional[LabeledInference]:
-        gold = Chunk(fact.gold_fact, 0.9, "gold", gold=True)
-        chunks = [gold, *_filler_chunks(2, fact.answer, seed)]
-        inf = Inference(
-            prompt=f"{fact.ambiguous_question}\n" + " ".join(c.text for c in chunks),
-            generated_answer="", retrieved_context=chunks, ground_truth=[fact.answer],
-            question=fact.ambiguous_question,
-            meta={"_sim": {"answer": fact.answer, "gold_fact": fact.gold_fact,
-                           "ambiguous": True,
-                           "readings": [fact.answer, fact.wrong_answer, "another reading"]}},
-        )
+        sim = {"answer": fact.answer, "gold_fact": fact.gold_fact, "ambiguous": True,
+               "readings": [fact.answer, fact.wrong_answer, "another reading"]}
+        # ~30% non-RAG: an ambiguous question is ambiguous with or without context.
+        if _u("amb_nonrag", fact.question, seed) < 0.30:
+            inf = Inference(
+                prompt=fact.ambiguous_question, generated_answer="", retrieved_context=None,
+                ground_truth=[fact.answer], question=fact.ambiguous_question, meta={"_sim": sim},
+            )
+        else:
+            gold = Chunk(fact.gold_fact, 0.9, "gold", gold=True)
+            n = _pick(2, 11, "amb_n", fact.question, seed)
+            fillers = _filler_chunks(n, fact.answer, seed, sents=1)
+            chunks = _place(gold, fillers, _u("amb_pos", fact.question, seed))
+            inf = Inference(
+                prompt=f"{fact.ambiguous_question}\n" + " ".join(c.text for c in chunks),
+                generated_answer="", retrieved_context=chunks, ground_truth=[fact.answer],
+                question=fact.ambiguous_question, meta={"_sim": sim},
+            )
 
         def gate(fv):
             amb, ic = _v(fv, "prompt_ambiguity", 0.0), _v(fv, "is_correct", 1.0)
@@ -161,9 +232,15 @@ class InjectionHarness:
 
     def hallucination(self, fact: Fact, seed: int = 0) -> Optional[LabeledInference]:
         # Non-RAG parametric fabrication -> isolates hallucination (retrieval masked).
+        # The question is paraphrased per seed: previously this recipe ignored `seed`
+        # entirely, so every seed produced a byte-identical row and the dedup pass
+        # silently deleted 2/3 of the hallucination class.
+        frames = ["{q}", "Answer concisely: {q}", "{q} Be specific.", "Question: {q}"]
+        question = frames[_pick(0, len(frames) - 1, "hal_frame", fact.question, seed)].format(
+            q=fact.question)
         inf = Inference(
-            prompt=fact.question, generated_answer="", retrieved_context=None,
-            ground_truth=[fact.answer], question=fact.question,
+            prompt=question, generated_answer="", retrieved_context=None,
+            ground_truth=[fact.answer], question=question,
             meta={"_sim": {"answer": fact.answer, "gold_fact": fact.gold_fact,
                            "distractor": fact.wrong_answer, "parametric_known": False}},
         )
@@ -174,9 +251,45 @@ class InjectionHarness:
 
         return self._finalize(inf, [M.HALLUCINATION], [], "hallucination", gate)
 
+    def hallucination_override(self, fact: Fact, seed: int = 0) -> Optional[LabeledInference]:
+        """RAG hallucination: the gold IS retrieved and attended, but a wrong
+        parametric belief overrides it.
+
+        This is the hard case. Behaviourally it is indistinguishable from context
+        dilution (gold present, answer wrong); only mechanistic evidence separates
+        them, so this recipe is what makes the mechanistic family load-bearing. It
+        also removes the "no context => hallucination" shortcut, since hallucination
+        now occurs with and without retrieval.
+        """
+        gold = Chunk(fact.gold_fact, 0.95, "gold", gold=True)
+        n = _pick(2, 10, "ovr_n", fact.question, seed)
+        fillers = _filler_chunks(n, fact.answer, seed, sents=1)
+        # gold at an EDGE position and a short context, so the mock's dilution
+        # trigger cannot fire — the wrong answer must come from the override alone.
+        chunks = _place(gold, fillers, 0.0 if _u("ovr_pos", fact.question, seed) < 0.5 else 1.0)
+        inf = Inference(
+            prompt=f"{fact.question}\n" + " ".join(c.text for c in chunks),
+            generated_answer="", retrieved_context=chunks, ground_truth=[fact.answer],
+            question=fact.question,
+            meta={"_sim": {"answer": fact.answer, "gold_fact": fact.gold_fact,
+                           "distractor": fact.wrong_answer, "parametric_override": True}},
+        )
+
+        def gate(fv):
+            gr, ic = _v(fv, "gold_recall_in_context", 0.0), _v(fv, "is_correct", 1.0)
+            par = _v(fv, "parametric_knowledge_score", 0.0)
+            # gold really is recoverable, the answer is still wrong, and (when the
+            # tier exposes it) the parametric score is high.
+            return (gr >= 0.6 and ic == 0.0), {"gold_recall": gr, "is_correct": ic,
+                                               "parametric": par}
+
+        return self._finalize(inf, [M.HALLUCINATION], [], "hallucination_override", gate)
+
     def reasoning_failure(self, mh: MultiHopFact, seed: int = 0) -> Optional[LabeledInference]:
         gold = Chunk(" ".join(mh.facts), 0.9, "gold", gold=True)
-        chunks = [gold, *_filler_chunks(2, mh.answer, seed)]
+        n = _pick(2, 11, "reason_n", mh.question, seed)
+        fillers = _filler_chunks(n, mh.answer, seed, sents=1)
+        chunks = _place(gold, fillers, _u("reason_pos", mh.question, seed))
         inf = Inference(
             prompt=f"{mh.question}\n" + " ".join(c.text for c in chunks),
             generated_answer="", retrieved_context=chunks, ground_truth=[mh.answer],
