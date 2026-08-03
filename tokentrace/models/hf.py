@@ -164,7 +164,6 @@ class HFModel(ModelHandle):
 
     @staticmethod
     def _attention_mass(attentions, from_pos: int, to_positions: list[int], heads) -> float:
-        import torch
 
         if not to_positions:
             return 0.0
@@ -181,7 +180,6 @@ class HFModel(ModelHandle):
         return float(sum(vals) / len(vals)) if vals else 0.0
 
     def _logit_lens(self, hidden, pos: int) -> tuple[Optional[float], Optional[float]]:
-        import torch
 
         try:
             lm_head = self.model.get_output_embeddings()

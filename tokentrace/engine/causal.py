@@ -16,7 +16,6 @@ from typing import Optional
 
 from tokentrace.core.types import (
     ALL_MODES,
-    Diagnosis,
     DiagnosisRole,
     EvidenceItem,
     FailureMode,

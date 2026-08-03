@@ -11,7 +11,6 @@ set capped at ``max_size``.
 
 from __future__ import annotations
 
-from typing import Optional
 
 from tokentrace.core.types import ALL_MODES, FailureMode
 

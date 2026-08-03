@@ -13,7 +13,6 @@ import math
 import pickle
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
 
 from tokentrace.core.types import FailureMode
 
