@@ -63,27 +63,26 @@ class ResidualClassifier:
         return self
 
     # ------------------------------------------------------------------ #
-    def residual(self, fv: FeatureVector) -> dict[FailureMode, float]:
-        """Trees-only raw margin per mode (0 where a head was not trained)."""
-        if not self.models:
-            return {m: 0.0 for m in ALL_MODES}
-        x = fv.to_array(self.feature_names).reshape(1, -1)
-        out: dict[FailureMode, float] = {}
-        for m in ALL_MODES:
-            model = self.models.get(m)
-            out[m] = float(model.predict(x, raw_score=True)[0]) if model else 0.0
-        return out
+    def contributions(
+        self, fv: FeatureVector
+    ) -> tuple[dict[FailureMode, float], dict[FailureMode, dict[str, float]]]:
+        """Return ``(raw_margin_per_mode, shap_per_mode)`` in ONE pass.
 
-    def shap(self, fv: FeatureVector) -> dict[FailureMode, dict[str, float]]:
-        """Per-mode TreeSHAP feature contributions (log-odds) for the learned part."""
+        TreeSHAP contributions sum exactly to the raw margin, so the margin is
+        derived rather than predicted again. Callers previously invoked
+        :meth:`residual` and :meth:`shap` separately, doubling the LightGBM calls —
+        which dominated benchmark runtime (~870 predicts per train+evaluate, ~2ms
+        each, i.e. most of the wall clock).
+        """
         if not self.models:
-            return {m: {} for m in ALL_MODES}
+            return ({m: 0.0 for m in ALL_MODES}, {m: {"__base__": 0.0} for m in ALL_MODES})
         x = fv.to_array(self.feature_names).reshape(1, -1)
-        out: dict[FailureMode, dict[str, float]] = {}
+        margins: dict[FailureMode, float] = {}
+        shaps: dict[FailureMode, dict[str, float]] = {}
         for m in ALL_MODES:
             model = self.models.get(m)
             if not model:
-                out[m] = {"__base__": 0.0}
+                margins[m], shaps[m] = 0.0, {"__base__": 0.0}
                 continue
             contrib = model.predict(x, pred_contrib=True)[0]  # [F+1], last = base
             d = {
@@ -94,8 +93,17 @@ class ResidualClassifier:
             # Keep the TreeSHAP base value so the evidence ledger can reconcile to
             # the full margin (z = rule_prior + base + sum(feature contributions)).
             d["__base__"] = float(contrib[-1])
-            out[m] = d
-        return out
+            shaps[m] = d
+            margins[m] = float(sum(contrib))
+        return margins, shaps
+
+    def residual(self, fv: FeatureVector) -> dict[FailureMode, float]:
+        """Trees-only raw margin per mode (0 where a head was not trained)."""
+        return self.contributions(fv)[0]
+
+    def shap(self, fv: FeatureVector) -> dict[FailureMode, dict[str, float]]:
+        """Per-mode TreeSHAP feature contributions (log-odds) for the learned part."""
+        return self.contributions(fv)[1]
 
     @property
     def is_fitted(self) -> bool:

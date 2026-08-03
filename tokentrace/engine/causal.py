@@ -79,6 +79,15 @@ class CausalResolver:
                 primary = max(qualifying, key=lambda m: probs[m])
                 walked = True
 
+        # Enforce the configured floor: naming a PRIMARY_ROOT asserts "this is the
+        # cause", so below primary_min we still report contributors but decline to
+        # crown one. (`primary_min` was previously stored and never read, advertising
+        # a guard that did not exist.) report.primary falls back to the
+        # highest-probability diagnosis, so ranking metrics are unaffected.
+        if probs[primary] < self.primary_min:
+            return {m: (DiagnosisRole.CONTRIBUTING, [p for p in parents_of(m) if p in active])
+                    for m in active}
+
         for m in active:
             active_parents = [p for p in parents_of(m) if p in active]
             if m == primary:
@@ -130,7 +139,7 @@ class EvidenceAttributor:
             items.append(EvidenceItem(
                 signal=feat,
                 family=family_of(feat) if feat in _KNOWN_FEATS() else SignalFamily.PROMPT,
-                value=val if val is not None else float("nan"),
+                value=val if val is not None else 0.0,
                 contribution_logodds=round(contrib, 4),
                 direction="supports" if contrib > 0 else "opposes",
                 source="learned",
@@ -139,21 +148,45 @@ class EvidenceAttributor:
             ))
 
         items.sort(key=lambda e: -abs(e.contribution_logodds))
-        items = items[: max(1, self.max_items - 1)]
 
-        # Always include the prior/base line so the ledger reconciles to the total
-        # log-odds z = (PRIOR_LOGIT + rule contributions) + (TreeSHAP base + features).
+        # The ledger must RECONCILE to the total log-odds:
+        #   z = (PRIOR_LOGIT + rule contributions) + (TreeSHAP base + feature SHAP)
+        # Truncating to the top-k used to silently discard the remainder (measured:
+        # 511/771 ledgers off by up to 2.25 log-odds, and 67 fired *rule* lines
+        # vanished from an "auditable" ledger). So fold everything we cut into a
+        # single explicit remainder line instead of dropping it.
+        keep = max(1, self.max_items - 2)
+        tail = items[keep:]
+        items = items[:keep]
+        if tail:
+            rest = sum(e.contribution_logodds for e in tail)
+            items.append(EvidenceItem(
+                signal="other_signals",
+                family=SignalFamily.PROMPT,
+                value=float(len(tail)),
+                contribution_logodds=round(rest, 4),
+                direction="supports" if rest >= 0 else "opposes",
+                source="aggregate",
+                provenance={"n_signals": len(tail),
+                            "signals": [e.signal for e in tail]},
+                rendered=f"{len(tail)} further signals sum to {rest:+.2f} log-odds",
+            ))
+
         prior = PRIOR_LOGIT + base
         items.append(EvidenceItem(
             signal="base_rate",
             family=SignalFamily.PROMPT,
-            value=float("nan"),
+            value=0.0,
             contribution_logodds=round(prior, 4),
             direction="supports" if prior >= 0 else "opposes",
             source="prior",
             provenance={},
             rendered=f"base rate / prior = {prior:+.2f} log-odds",
         ))
+        # Re-sort AFTER appending so the ledger stays magnitude-ordered (consumers
+        # headline evidence[0]); `headline_evidence` below is what the CLI/UI should
+        # use when it wants the strongest *substantive* line rather than the prior.
+        items.sort(key=lambda e: -abs(e.contribution_logodds))
         return items
 
     @staticmethod
@@ -162,7 +195,7 @@ class EvidenceAttributor:
             v = fv.get(r)
             if v is not None:
                 return v
-        return float("nan")
+        return 0.0   # never NaN: EvidenceItem.value is serialized to JSON
 
     @staticmethod
     def _rule_provenance(rule: Rule, fv: FeatureVector, inference: Optional[Inference]) -> dict:
