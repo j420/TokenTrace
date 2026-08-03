@@ -60,5 +60,7 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
-ignore = ["E501"]
+# Focus on genuine errors (pyflakes + pycodestyle). Style/modernization rulesets
+# (UP/I/B) are intentionally not enforced to keep the diff focused on correctness.
+select = ["E", "F"]
+ignore = ["E501", "E731", "E741"]

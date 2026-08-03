@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import pytest
 
-from tokentrace.core.types import Tier
 from tokentrace.data import build_dataset
 from tokentrace.eval import train_and_evaluate
 

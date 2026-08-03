@@ -158,13 +158,14 @@ tt = TokenTrace.default(backend="gguf", model_name="qwen3-4b")   # or backend="h
 ```
 tokentrace/
   core/        data contracts (+ JSON serde)
-  models/      ModelHandle: mock · gguf · hf · registry (fallback ladder)
-  signals/     4 extractor families · scorers · missingness-aware pipeline
+  models/      ModelHandle: mock · gguf · hf · nnsight · registry (fallback ladder)
+  signals/     4 extractor families · heuristic + model (NLI/embedding) scorers · pipeline
   engine/      rules · residual classifier · calibration · conformal · causal · diagnosis
   recommend/   recommendations + simulated-intervention validation
   data/        seed pool · injection harness · synthetic builder · real loaders
   eval/        metrics · train/eval benchmark
   retrieval/   FAISS RAG
+  cache/       content-addressed on-disk trace cache
   app/         Streamlit trace explorer
   cli.py  api.py
 tests/         26 tests (mock coherence, tiers, discriminators, causal chain, benchmark)
