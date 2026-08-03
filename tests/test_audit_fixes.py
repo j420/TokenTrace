@@ -263,3 +263,40 @@ def test_abstention_is_split_into_healthy_and_declined():
     d = Metrics().as_dict()
     for k in ("healthy_abstention_rate", "declined_rate", "recommendation_negatives"):
         assert k in d, f"{k} missing: a combined rate hides good vs bad abstention"
+
+
+# --------------------------------------------------------------------------- #
+# Project objective: run with NO GPU. Enforced, not just documented.
+# --------------------------------------------------------------------------- #
+def test_no_gpu_dependency_anywhere():
+    """Running GPU-free is a stated objective of the project, so it is a test.
+
+    Guards against the usual drift: a `.cuda()` call, a `device="cuda"` default, or
+    a `device_map="auto"` that would silently claim an accelerator.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "tokentrace"
+    banned = re.compile(r"\.cuda\(|device\s*=\s*[\"']cuda|device_map\s*=\s*[\"']auto"
+                        r"|torch\.cuda|\.to\([\"']cuda")
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        for i, line in enumerate(path.read_text().splitlines(), 1):
+            if banned.search(line):
+                offenders.append(f"{path.relative_to(root)}:{i}: {line.strip()}")
+    assert not offenders, "GPU dependency introduced:\n" + "\n".join(offenders)
+
+
+def test_every_backend_defaults_to_cpu():
+    """Each real backend must default to CPU; a caller may opt into a device, but
+    the default path must never require one."""
+    import inspect
+
+    from tokentrace.models.hf import HFModel
+    from tokentrace.models.nnsight import NNsightModel
+    from tokentrace.signals.model_scorers import ModelScorers
+
+    for cls in (HFModel, NNsightModel, ModelScorers):
+        default = inspect.signature(cls.__init__).parameters["device"].default
+        assert default == "cpu", f"{cls.__name__} defaults to device={default!r}"

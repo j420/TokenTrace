@@ -13,8 +13,11 @@ a **corrective recommendation that is validated by actually re-running the fix**
 > Think of it as *differential diagnosis for LLMs*: collect evidence → rank a
 > differential → run a confirmatory test → prescribe a treatment → verify it.
 
-**No GPU required.** Everything — build, test, demo — runs on CPU. A GPU is an
-optional accelerator for one tier only (see [CPU-first](#cpu-first-no-gpu-required)).
+**CPU-only, by design — not as a fallback.** Running without a GPU is a project
+objective, and *every* tier honours it, including white-box causal analysis: the
+causal test is input ablation and activation patching runs on small models, both on
+CPU. No code path imports CUDA, and every backend defaults to `device="cpu"`
+(enforced by a test). See [CPU-first](#cpu-first-no-gpu-required).
 
 ---
 
@@ -139,16 +142,22 @@ non-RAG, abstention, reasoning-vs-knowledge-gap, tokenizer differences, …).
 
 ## CPU-first (no GPU required)
 
-| what | how (CPU) |
-|---|---|
-| generation / resampling | quantized **GGUF** via llama.cpp (`tokentrace[generate]`) |
-| grey-box mechanistic | single **HF** forward pass: attention-to-context, logit-lens, ReDeEP scores (`tokentrace[mechanistic]`) |
-| white-box (causal) | **input-ablation** causal test on the 4B models, or activation patching on small dev models |
-| retrieval / NLI | `faiss-cpu` + small sentence-transformer (`tokentrace[retrieval]`) |
+| what | how (CPU) | cost |
+|---|---|---|
+| generation / resampling | quantized **GGUF** via llama.cpp (`tokentrace[generate]`) | ~3 GB RAM, Q4_K_M 4B |
+| grey-box mechanistic | single **HF** forward pass: attention-to-context, logit-lens, ReDeEP scores (`tokentrace[mechanistic]`) | ~8 GB RAM |
+| white-box (causal) | **input-ablation** causal test (2 extra forward passes), or activation patching on small dev models | ~2–4 GB RAM |
+| retrieval / NLI | `faiss-cpu` + small sentence-transformer (`tokentrace[retrieval]`) | < 1 GB |
 
-Three **compute-adaptive tiers** map onto what CPU can afford — black-box (I/O only),
-grey-box (logprobs + one forward pass), white-box (causal). A GPU only *speeds up*
-full-4B activation patching; nothing depends on it.
+All three **compute-adaptive tiers** — black-box (I/O only), grey-box (logprobs + one
+forward pass), white-box (causal) — run on CPU. The white tier is CPU-affordable
+because the causal signal is obtained by **input ablation** rather than GPU-scale
+activation patching; that substitution is the design decision that keeps the whole
+framework GPU-free.
+
+**Whole-project requirement: a 16 GB laptop.** No VM, no container, no accelerator,
+no cloud spend. Everything above (build, tests, demo, the full benchmark, and real
+4B models) fits there.
 
 ## Real models & datasets
 

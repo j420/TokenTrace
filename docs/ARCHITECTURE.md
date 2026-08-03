@@ -88,8 +88,10 @@ No public dataset ships `(inference → failure-mode)` labels, so:
 - **Black-box** — prompt + retrieval + resampled confidence. CPU-cheap.
 - **Grey-box** — + logit-lens, attention-to-context/gold, ReDeEP, from one HF
   forward pass. Default for 4B models on CPU.
-- **White-box** — + causal test (`gold_patch_effect` via input ablation on CPU, or
-  activation patching on small models / optional GPU).
+- **White-box** — + causal test: `gold_patch_effect` via INPUT ABLATION (two extra
+  forward passes) on CPU, or activation patching on small dev models. Choosing
+  ablation over GPU-scale patching is what keeps the top tier CPU-affordable; no
+  tier requires an accelerator.
 
 Missing families are handled by: GBT NaN routing · per-signature calibration ·
 rules abstaining · wider conformal sets → lower confidence → abstention/escalation.
