@@ -33,8 +33,9 @@ def _print_report(inf: Inference, report) -> None:
         role = f" [{d.role.value}]" if d.role else ""
         parents = (" <- " + ", ".join(p.pretty for p in d.causal_parents)) if d.causal_parents else ""
         print(f"    {d.probability:5.2f}  {d.mode.pretty:18s}{role}{parents}")
-        if d.evidence:
-            print(f"           evidence: {d.evidence[0].rendered}")
+        head = d.headline_evidence
+        if head is not None:
+            print(f"           evidence: {head.rendered}")
         for r in d.recommendations:
             tag = {True: "✓ validated", False: "✗ no effect", None: ""}[r.validated]
             print(f"           fix: {r.action} {tag}")
