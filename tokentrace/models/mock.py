@@ -70,7 +70,8 @@ class _Decision:
 class MockModel(ModelHandle):
     """A deterministic, tier-aware simulated LLM."""
 
-    def __init__(self, profile: Optional[ModelProfile] = None, tier: Tier = Tier.WHITE):
+    def __init__(self, profile: Optional[ModelProfile] = None, tier: Tier = Tier.WHITE,
+                 noise: float = 0.0):
         self.profile = profile or ModelProfile(
             name="mock-4b",
             n_layers=32,
@@ -80,6 +81,10 @@ class MockModel(ModelHandle):
             lost_in_middle_baseline=[0.9, 0.75, 0.6, 0.72, 0.88],  # U-shaped
         )
         self.tier = tier
+        # Deterministic signal noise in [0,~0.5]: jitters the mechanistic/confidence
+        # estimates so the failure modes are NOT perfectly separable — makes the
+        # benchmark exercise calibration/conformal/abstention like real, noisy data.
+        self.noise = noise
 
     # ------------------------------------------------------------------ #
     # Core decision
@@ -185,6 +190,8 @@ class MockModel(ModelHandle):
             text = pool[int(_seeded_unit(prompt, seed) * len(pool)) % len(pool)]
 
         base_H = self._entropy_profile(dec)
+        if self.noise > 0:  # blur the confidence estimate
+            base_H = max(0.02, base_H * (1 + self.noise * (2 * _seeded_unit("noiseH", prompt, seed) - 1)))
         toks = text.split() or [text]
         entropies, logprobs, ttexts = [], [], []
         for i, t in enumerate(toks):
@@ -257,6 +264,20 @@ class MockModel(ModelHandle):
                 gold_patch = 0.05
             else:
                 gold_patch = 0.02
+
+        if self.noise > 0:
+            p = inference.prompt
+
+            def jit(x: Optional[float], key: str) -> Optional[float]:
+                if x is None:
+                    return None
+                delta = self.noise * (2 * _seeded_unit("noise", key, p) - 1) * 0.4
+                return min(1.0, max(0.0, x + delta))
+
+            ctx_attn, gold_attn = jit(ctx_attn, "ctx"), jit(gold_attn, "gold")
+            ext, param = jit(ext, "ext"), jit(param, "param")
+            answer_layer, stability = jit(answer_layer, "al"), jit(stability, "st")
+            gold_patch = jit(gold_patch, "gp")
 
         return CaptureResult(
             n_layers=n_layers,

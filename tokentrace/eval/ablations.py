@@ -100,3 +100,77 @@ def run_ablations(model: ModelHandle, dataset=None, pipeline: Optional[SignalPip
         "calibration": calibration,
         "conformal": conformal,
     }
+
+
+#: Continuous signal features that a real estimator (NLI, embeddings, a classifier,
+#: attention readouts) would produce with observation noise. Structural counts
+#: (n_chunks, lengths, multihop flag) are exact and left alone.
+_NOISY_FEATURES = {
+    "prompt_ambiguity", "answer_supported_by_context", "max_chunk_relevance",
+    "mean_chunk_relevance", "gold_position_frac", "gold_recall_in_context",
+    "semantic_entropy", "self_consistency", "mean_token_entropy", "max_token_entropy",
+    "context_attention_ratio", "gold_attention_ratio", "logit_lens_answer_layer",
+    "logit_lens_stability", "external_context_score", "parametric_knowledge_score",
+    "gold_patch_effect",
+}
+
+
+class NoisyPipeline:
+    """Wraps a pipeline and adds deterministic observation noise to the continuous
+    signal features (modeling imperfect NLI/embedding/attention estimators), plus a
+    small chance of flipping the correctness gate. Used to break the synthetic
+    corpus's perfect separability so calibration/conformal/abstention are exercised."""
+
+    def __init__(self, base: SignalPipeline, sigma: float):
+        self.base = base
+        self.sigma = sigma
+
+    def run(self, inference, model):
+        from tokentrace.models.mock import _seeded_unit
+
+        fv = self.base.run(inference, model)
+        if self.sigma <= 0:
+            return fv
+        p = inference.prompt
+        for name in list(fv.values):
+            if name in _NOISY_FEATURES:
+                u = _seeded_unit("fnoise", name, p)
+                fv.values[name] = min(1.5, max(0.0, fv.values[name] + self.sigma * (2 * u - 1) * 0.4))
+        if fv.has("is_correct") and _seeded_unit("flip", p) < self.sigma * 0.2:
+            fv.values["is_correct"] = 1.0 - fv.values["is_correct"]
+        return fv
+
+
+def run_robustness(
+    noise_levels: tuple[float, ...] = (0.0, 0.2, 0.35),
+    seeds: tuple[int, ...] = (0, 1, 2, 3),
+    pipeline: Optional[SignalPipeline] = None,
+) -> dict:
+    """Sweep signal-observation noise to show the metrics stop saturating and that
+    calibration earns its keep. Labels come from the CLEAN pipeline (trustworthy);
+    train + eval use the NOISY pipeline, mirroring real data where the estimators
+    themselves are imperfect.
+    """
+    from tokentrace.models.registry import load_model
+
+    pipeline = pipeline or SignalPipeline()
+    model = load_model("mock-4b", backend="mock")
+    dataset = build_dataset(model, pipeline, seeds=seeds)   # clean labels
+    train, cal, test = split_dataset(dataset)
+
+    out = {}
+    for nz in noise_levels:
+        noisy = NoisyPipeline(pipeline, nz)
+        engine = train_engine(train, cal, model, noisy)
+        met = evaluate(engine, test, model, Tier.WHITE, noisy).as_dict()
+        out[f"{nz:.2f}"] = {
+            "diagnosis_accuracy": met["diagnosis_accuracy"],
+            "top3_accuracy": met["top3_accuracy"],
+            "abstention_rate": met["abstention_rate"],
+            "conformal_set_size": met["conformal_set_size"],
+            "debugging_time_reduction": met["debugging_time_reduction"],
+            "mean_root_rank": met["mean_root_rank"],
+            "ece_uncalibrated": _ece(engine, test, model, noisy, calibrated=False),
+            "ece_calibrated": _ece(engine, test, model, noisy, calibrated=True),
+        }
+    return out

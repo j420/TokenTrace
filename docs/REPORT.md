@@ -111,6 +111,38 @@ fixes that target a *true* failure mode on a *non-abstained* report are counted.
 it is best read as a *plumbing check* that the intervention loop works; real fix
 efficacy must be measured against a real model.
 
+### 4.5 Debugging-time reduction (proposal target: 30–40%)
+
+Proxy: how far down the ranked differential a developer reads to reach the true root
+cause. Baseline = unaided inspection in no particular order over the 5 modes
+(expected rank (K+1)/2 = 3.0). TokenTrace puts the true root at **mean rank ≈ 1.0**,
+for a **debugging-time reduction of ≈ 0.67 (67%)** — comfortably above the 30–40%
+target. (This is a ranking proxy; the real figure needs the user study in §7. It
+degrades gracefully to ~0.60 under heavy signal noise, §4.6.)
+
+### 4.6 Robustness under observation noise
+
+The synthetic signals are perfectly coherent, which is why the headline numbers
+saturate. To stress the calibration/abstention machinery we add deterministic
+*observation noise* to the continuous signal features (modeling imperfect NLI /
+embedding / attention estimators; labels stay clean). Train and eval both use the
+noisy pipeline.
+
+| noise σ | diagnosis | abstention | debug-time↓ | ECE uncalibrated | ECE calibrated |
+|---|---|---|---|---|---|
+| 0.00 | 1.000 | 0.130 | 0.667 | 0.000 | 0.000 |
+| 0.25 | 0.986 | 0.145 | 0.667 | 0.0029 | 0.0033 |
+| 0.50 | 0.986 | 0.145 | 0.644 | 0.0057 | 0.0053 |
+| 0.75 | 0.942 | **0.188** | 0.600 | 0.0229 | **0.0168** |
+
+Three things the reviewers asked for, now visible:
+1. **Metrics stop saturating** — diagnosis degrades 1.00 → 0.94 as noise rises.
+2. **Abstention adapts** — the engine abstains *more* (0.13 → 0.19) as signals get
+   noisier, i.e. it knows when it's less sure rather than guessing confidently.
+3. **Calibration earns its keep** — at high noise, isotonic calibration cuts ECE by
+   ~27% (0.0229 → 0.0168); at low noise it is (correctly) a near-no-op. This is the
+   behavior the per-signature calibration was designed for.
+
 ## 5. Findings
 
 1. The interpretable rules are strong on their own (0.826) and the learned residual
@@ -120,13 +152,20 @@ efficacy must be measured against a real model.
    synthetic data.
 3. Degradation is graceful and *self-aware*: black-box drops accuracy modestly and
    raises abstention rather than producing confident wrong answers.
+4. The ranked differential yields a ~67% debugging-time reduction proxy (root at
+   rank ≈ 1 vs an unaided baseline rank of 3), above the 30–40% target.
+5. Under observation noise the metrics de-saturate, abstention rises, and calibration
+   reduces ECE by ~27% at high noise — the calibration/abstention machinery works as
+   designed, not just on separable data.
 
 ## 6. Threats to validity
 
 - **Synthetic self-consistency.** The mock's signals are internally coherent by
   construction, so the modes are more separable than real data. This is why several
-  metrics saturate at 1.0; the *ablations* (which measure relative contribution) are
-  more meaningful than the absolute headline numbers.
+  headline metrics saturate at 1.0; the *ablations* (relative contribution) and the
+  *noise sweep* (§4.6, which de-saturates the numbers and exercises calibration) are
+  more meaningful than the absolute headline numbers. It is still a synthetic proxy
+  for real difficulty.
 - **Recommendation tautology** (§4.4).
 - **Real backends unvalidated at runtime** (HF unreachable in the build env). They
   were audited by a three-reviewer correctness pass and the confirmed defects fixed

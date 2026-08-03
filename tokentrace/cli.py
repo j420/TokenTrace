@@ -138,7 +138,15 @@ def cmd_ablate(args) -> int:
     print("per-tier:")
     for t, v in res["per_tier"].items():
         print(f"  {t:6s} diagnosis={v['diagnosis_accuracy']:.3f} top3={v['top3_accuracy']:.3f} "
-              f"conf_cov={v['conformal_coverage']:.3f} abstain={v['abstention_rate']:.3f}")
+              f"conf_cov={v['conformal_coverage']:.3f} abstain={v['abstention_rate']:.3f} "
+              f"dbg_time_reduction={v['debugging_time_reduction']:.3f}")
+
+    from tokentrace.eval.ablations import run_robustness
+    print("\nrobustness under signal-observation noise (calibration should reduce ECE as noise grows):")
+    print(f"  {'noise':6s} {'diag':>6s} {'abstain':>8s} {'dbg_time':>9s} {'ECE_uncal':>10s} {'ECE_cal':>8s}")
+    for nz, mm in run_robustness(noise_levels=(0.0, 0.25, 0.5, 0.75), seeds=seeds).items():
+        print(f"  {nz:6s} {mm['diagnosis_accuracy']:6.3f} {mm['abstention_rate']:8.3f} "
+              f"{mm['debugging_time_reduction']:9.3f} {mm['ece_uncalibrated']:10.4f} {mm['ece_calibrated']:8.4f}")
     return 0
 
 
