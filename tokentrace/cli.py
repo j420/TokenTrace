@@ -116,6 +116,32 @@ def cmd_inject(args) -> int:
     return 0
 
 
+def cmd_ablate(args) -> int:
+    from tokentrace.eval.ablations import run_ablations
+    from tokentrace.models import load_model
+
+    model = load_model(args.model, backend=args.backend, tier=Tier.WHITE)
+    seeds = tuple(int(s) for s in args.seeds.split(","))
+    res = run_ablations(model, seeds=seeds)
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0
+    print(f"sizes: {res['sizes']}\n")
+    al = res["ablation_learned_head"]
+    print("learned-head ablation (white-box):")
+    for k, v in al.items():
+        print(f"  {k:16s} diagnosis={v['diagnosis_accuracy']:.3f}  top3={v['top3_accuracy']:.3f}")
+    print("\nper-signal-family ablation (drop one family; lower diagnosis = more load-bearing):")
+    for f, v in res["per_family_dropped"].items():
+        print(f"  drop {f:12s} diagnosis={v['diagnosis_accuracy']:.3f}")
+    print(f"\ncalibration ECE: {res['calibration']}")
+    print("per-tier:")
+    for t, v in res["per_tier"].items():
+        print(f"  {t:6s} diagnosis={v['diagnosis_accuracy']:.3f} top3={v['top3_accuracy']:.3f} "
+              f"conf_cov={v['conformal_coverage']:.3f} abstain={v['abstention_rate']:.3f}")
+    return 0
+
+
 def cmd_eval(args) -> int:
     from tokentrace.data.synthetic import build_dataset
     from tokentrace.eval.benchmark import train_and_evaluate
@@ -167,6 +193,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     e.add_argument("--seeds", default="0,1,2,3")
     e.add_argument("--json", action="store_true")
     e.set_defaults(func=cmd_eval)
+
+    ab = sub.add_parser("ablate", parents=[common], help="run ablation studies (learned head, per-family, calibration)")
+    ab.add_argument("--seeds", default="0,1,2,3")
+    ab.add_argument("--json", action="store_true")
+    ab.set_defaults(func=cmd_ablate)
 
     args = p.parse_args(argv)
     return args.func(args)

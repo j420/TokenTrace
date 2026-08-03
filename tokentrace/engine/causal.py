@@ -23,7 +23,7 @@ from tokentrace.core.types import (
     Inference,
     SignalFamily,
 )
-from tokentrace.engine.rules import Rule
+from tokentrace.engine.rules import PRIOR_LOGIT, Rule
 from tokentrace.signals.features import family_of
 
 M = FailureMode
@@ -72,11 +72,12 @@ class CausalResolver:
         walked = True
         while walked:
             walked = False
-            for p in parents_of(primary):
-                if p in active and probs[p] >= self.parent_ratio * probs[primary]:
-                    primary = p
-                    walked = True
-                    break
+            qualifying = [p for p in parents_of(primary)
+                          if p in active and probs[p] >= self.parent_ratio * probs[primary]]
+            if qualifying:
+                # walk to the STRONGEST qualifying parent, not the first in dict order
+                primary = max(qualifying, key=lambda m: probs[m])
+                walked = True
 
         for m in active:
             active_parents = [p for p in parents_of(m) if p in active]
@@ -120,8 +121,11 @@ class EvidenceAttributor:
                 rendered=text,
             ))
 
-        # Learned (TreeSHAP) contributions for this mode.
-        for feat, contrib in sorted(shap.items(), key=lambda kv: -abs(kv[1])):
+        # Learned (TreeSHAP) contributions for this mode (excluding the base value).
+        base = shap.get("__base__", 0.0)
+        for feat, contrib in sorted(
+            ((k, v) for k, v in shap.items() if k != "__base__"), key=lambda kv: -abs(kv[1])
+        ):
             val = fv.get(feat)
             items.append(EvidenceItem(
                 signal=feat,
@@ -135,7 +139,22 @@ class EvidenceAttributor:
             ))
 
         items.sort(key=lambda e: -abs(e.contribution_logodds))
-        return items[: self.max_items]
+        items = items[: max(1, self.max_items - 1)]
+
+        # Always include the prior/base line so the ledger reconciles to the total
+        # log-odds z = (PRIOR_LOGIT + rule contributions) + (TreeSHAP base + features).
+        prior = PRIOR_LOGIT + base
+        items.append(EvidenceItem(
+            signal="base_rate",
+            family=SignalFamily.PROMPT,
+            value=float("nan"),
+            contribution_logodds=round(prior, 4),
+            direction="supports" if prior >= 0 else "opposes",
+            source="prior",
+            provenance={},
+            rendered=f"base rate / prior = {prior:+.2f} log-odds",
+        ))
+        return items
 
     @staticmethod
     def _lead_value(fv: FeatureVector, required: tuple[str, ...]) -> float:

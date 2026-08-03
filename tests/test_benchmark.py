@@ -42,3 +42,17 @@ def test_per_mode_precision_reasonable(results):
     for mode, s in white.items():
         if s["support"] >= 3:
             assert s["f1"] >= 0.6, f"{mode} F1 too low: {s}"
+
+
+def test_ablations_structure_and_findings(model):
+    from tokentrace.eval.ablations import run_ablations
+
+    res = run_ablations(model, seeds=(0, 1))
+    al = res["ablation_learned_head"]
+    # the learned residual never hurts vs pure rules
+    assert al["rules_plus_gbt"]["diagnosis_accuracy"] >= al["rules_only"]["diagnosis_accuracy"]
+    # retrieval family is more load-bearing than confidence (it carries 2 modes)
+    pf = res["per_family_dropped"]
+    assert pf["retrieval"]["diagnosis_accuracy"] <= pf["confidence"]["diagnosis_accuracy"]
+    # dropping the prompt family destroys ambiguity detection specifically
+    assert pf["prompt"]["per_mode"]["prompt_ambiguity"]["f1"] < 0.5

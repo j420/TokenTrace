@@ -54,11 +54,18 @@ class TraceStore:
 
     # ------------------------------------------------------------------ #
     def make_key(self, inference: Inference, model_name: str, tier: Tier, extra: str = "") -> str:
-        ctx = [c.text for c in inference.retrieved_context] if inference.retrieved_context else None
+        # Include EVERY field the captured signals depend on — notably per-chunk
+        # gold/source_id/retriever_score and the question — so two inferences with
+        # the same prompt text but different gold-marking don't collide to a stale
+        # trace (rag.make_inference toggles exactly that).
+        ctx = (
+            [[c.text, c.gold, c.source_id, c.retriever_score] for c in inference.retrieved_context]
+            if inference.retrieved_context is not None else None
+        )
         payload = json.dumps({
             "model": model_name, "tier": tier.label, "prompt": inference.prompt,
-            "answer": inference.generated_answer, "context": ctx,
-            "gt": inference.ground_truth, "extra": extra,
+            "question": inference.question, "answer": inference.generated_answer,
+            "context": ctx, "gt": inference.ground_truth, "extra": extra,
         }, sort_keys=True, ensure_ascii=False)
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 

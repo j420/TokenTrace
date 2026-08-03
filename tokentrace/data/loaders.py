@@ -28,7 +28,12 @@ def _load(path: str, name: Optional[str] = None, split: str = "validation"):
         from datasets import load_dataset
     except ImportError as e:  # pragma: no cover - optional extra
         raise ImportError("Real loaders need the 'data' extra: pip install 'tokentrace[data]'") from e
-    return load_dataset(path, name, split=split)
+    # Script-based datasets (hotpot_qa, natural_questions, truthful_qa) need
+    # trust_remote_code on datasets>=2.16; fall back for older versions lacking the kwarg.
+    try:
+        return load_dataset(path, name, split=split, trust_remote_code=True)
+    except TypeError:
+        return load_dataset(path, name, split=split)
 
 
 # --------------------------------------------------------------------------- #

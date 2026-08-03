@@ -45,7 +45,20 @@ def build_dataset(
             li = harness.reasoning_failure(mh, seed=s)
             if li is not None:
                 out.append(li)
-    return out
+
+    # Drop exact-duplicate examples: some recipes (e.g. the non-RAG hallucination
+    # prompt) are seed-invariant and would otherwise contribute identical rows for
+    # every seed, tripling their support and shrinking eval diversity.
+    seen: set = set()
+    uniq: list[LabeledInference] = []
+    for li in out:
+        key = (li.inference.prompt, li.inference.generated_answer,
+               tuple(sorted(m.value for m in li.labels)))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(li)
+    return uniq
 
 
 def dataset_summary(dataset: list[LabeledInference]) -> dict:
