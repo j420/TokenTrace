@@ -65,6 +65,12 @@ class _Decision:
     gold_pos_frac: float      # position of gold chunk in [0,1] (0.5 = middle)
     n_chunks: int
     context_tokens: int
+    # Parametric override: the gold IS present AND attended, but a wrong parametric
+    # belief wins anyway. Behaviourally identical to dilution (gold present + wrong
+    # answer); separable ONLY by mechanistic evidence — high parametric score and
+    # early answer formation despite healthy gold attention. This is the ReDeEP
+    # signature, and it is what makes the mechanistic family load-bearing.
+    overrode: bool = False
 
 
 class MockModel(ModelHandle):
@@ -134,6 +140,12 @@ class MockModel(ModelHandle):
             and context_tokens > 150
         )
 
+        if sim.get("parametric_override") and gold_present:
+            # Gold present AND attended, but a wrong parametric belief overrides it.
+            return _Decision(distractor, False, False, False, False, False,
+                             gold_present, gold_pos_frac, len(chunks), context_tokens,
+                             overrode=True)
+
         if requires_multihop and hard_composition and gold_present:
             # Facts present, sub-hops answerable, composition fails.
             return _Decision(distractor, False, False, False, False, True,
@@ -160,6 +172,8 @@ class MockModel(ModelHandle):
     def _entropy_profile(self, dec: _Decision) -> float:
         if dec.ambiguous:
             return 1.2
+        if dec.overrode:
+            return 0.28          # confidently wrong — the dangerous parametric override
         if dec.reasoning_failed:
             return 0.85
         if dec.grounded:
@@ -225,6 +239,14 @@ class MockModel(ModelHandle):
             ctx_attn, gold_attn = 0.18, 0.10
             ext, param = 0.20, 0.82                # low context read, high parametric push
             answer_layer, stability = 0.30, 0.85   # forms early from memory
+        elif dec.overrode:
+            # ReDeEP signature: the model DID read the gold (healthy gold attention)
+            # but a parametric belief won. Distinguishable from dilution ONLY here:
+            # dilution has LOW gold attention and a LATE answer; override has HIGH
+            # gold attention, a HIGH parametric score and an EARLY answer.
+            ctx_attn, gold_attn = 0.45, 0.42
+            ext, param = 0.35, 0.88
+            answer_layer, stability = 0.28, 0.88
         elif dec.ambiguous:
             # Confident commitment to an alternate reading: the model DOES attend to
             # the context and forms an answer early and stably (not buried/unattended
