@@ -49,10 +49,17 @@ context-dilution** discriminator.
 - **Residual (`classifier.py`)** — LightGBM one-vs-rest with the rule log-odds as
   `init_score`; trees fit the residual. Total `z_mode = rule_logit + trees_margin`.
   Native NaN handling routes around missing families.
-- **Calibration (`calibration.py`)** — isotonic per `(mode, missingness_signature)`
-  with fallback to `(mode, global)` then sigmoid.
-- **Conformal (`conformal.py`)** — APS sets targeting Top-3 coverage; set size is a
-  difficulty readout.
+- **Calibration (`calibration.py`)** — per `(mode, missingness_signature)`, where the
+  signature also records whether a usable GROUND-TRUTH REFERENCE was available (the
+  GT-dependent features live inside otherwise-present families, so without this a
+  production trace would silently reuse a map fitted on reference-bearing data).
+  Self-validating: a map is adopted only if it beats the raw sigmoid on held-out
+  Brier score. Isotonic on large buckets, Platt on thin ones. Hierarchical
+  fallback: exact signature -> ref/noref -> global -> raw sigmoid.
+- **Conformal (`conformal.py`)** — APS sets over NORMALIZED marginals (the engine
+  emits independent one-vs-rest probabilities that do not sum to 1; accumulating
+  them raw made tau fit to 1.0 and inverted the set-size signal). Masked modes are
+  excluded so an impossible cause never pads a set.
 - **Causal (`causal.py`)** — fixed DAG (`{ambiguity, retrieval, dilution} →
   {reasoning, hallucination}`); resolver starts from the strongest active mode and
   walks upstream only while a parent is comparably strong; `EvidenceAttributor`
