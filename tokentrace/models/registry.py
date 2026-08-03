@@ -82,7 +82,7 @@ def load_model(
     tier = Tier(min(int(tier), int(profile.max_tier)))
 
     if backend == "mock":
-        return MockModel(profile=profile, tier=tier)
+        return MockModel(profile=profile, tier=tier, **kwargs)
     if backend == "gguf":
         from tokentrace.models.gguf import GGUFModel
 

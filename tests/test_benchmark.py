@@ -44,6 +44,24 @@ def test_per_mode_precision_reasonable(results):
             assert s["f1"] >= 0.6, f"{mode} F1 too low: {s}"
 
 
+def test_debugging_time_reduction_meets_target(results):
+    # proposal target is 30-40%; the ranked differential should clear it
+    assert results["tiers"]["white"]["debugging_time_reduction"] >= 0.3
+
+
+def test_noise_desaturates_and_calibration_helps():
+    from tokentrace.eval.ablations import run_robustness
+
+    r = run_robustness(noise_levels=(0.0, 0.75), seeds=(0, 1, 2))
+    lo, hi = r["0.00"], r["0.75"]
+    # heavy observation noise must not IMPROVE accuracy (de-saturation)
+    assert hi["diagnosis_accuracy"] <= lo["diagnosis_accuracy"]
+    # abstention should not drop as signals get noisier
+    assert hi["abstention_rate"] >= lo["abstention_rate"] - 1e-9
+    # calibration should not hurt, and should help at high noise
+    assert hi["ece_calibrated"] <= hi["ece_uncalibrated"] + 0.005
+
+
 def test_ablations_structure_and_findings(model):
     from tokentrace.eval.ablations import run_ablations
 

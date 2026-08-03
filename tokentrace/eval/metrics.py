@@ -49,6 +49,8 @@ class Metrics:
     recommendation_precision: float = 0.0
     recommendation_n: int = 0
     abstention_rate: float = 0.0
+    debugging_time_reduction: float = 0.0        # vs. an unaided (random-order) baseline
+    mean_root_rank: float = 0.0                  # mean rank of the true root in the differential
     per_mode: dict = field(default_factory=dict)   # mode -> {precision, recall, f1, support}
 
     def as_dict(self) -> dict:
@@ -61,6 +63,8 @@ class Metrics:
             "recommendation_precision": round(self.recommendation_precision, 4),
             "recommendation_n": self.recommendation_n,
             "abstention_rate": round(self.abstention_rate, 4),
+            "debugging_time_reduction": round(self.debugging_time_reduction, 4),
+            "mean_root_rank": round(self.mean_root_rank, 4),
             "per_mode": self.per_mode,
         }
 
@@ -74,6 +78,7 @@ def compute_metrics(
     diag_correct = top3_correct = abstained = 0
     conf_cov = conf_size_sum = conf_total = 0
     rec_hits = rec_total = 0
+    root_ranks: list[int] = []   # rank of the true root in the ranked differential
     # multi-label counters
     tp = {m: 0 for m in ALL_MODES}
     fp = {m: 0 for m in ALL_MODES}
@@ -99,6 +104,10 @@ def compute_metrics(
             conf_total += 1
             conf_cov += int(any(m in report.conformal_set for m in gp_set))
             conf_size_sum += len(report.conformal_set)
+            # Debugging-time proxy: how far down the ranked differential a developer
+            # must read to reach the true root (rank 1 = first hypothesis to check).
+            ranked_all = report.ranked_modes()
+            root_ranks.append(min(ranked_all.index(m) + 1 for m in gp_set if m in ranked_all))
 
         # multi-label detection (predicted-present = prob >= threshold)
         gold = set(li.labels)
@@ -132,6 +141,14 @@ def compute_metrics(
         per_mode[m.value] = {"precision": round(p, 4), "recall": round(r, 4),
                              "f1": round(f1, 4), "support": support[m]}
 
+    # Debugging-time reduction vs an unaided baseline that inspects failure modes in
+    # no particular order (expected rank (K+1)/2 = 3.0 for the 5 modes). With
+    # TokenTrace the developer reads the ranked differential top-down, so the mean
+    # rank of the true root is the expected number of hypotheses checked.
+    mean_root_rank = sum(root_ranks) / len(root_ranks) if root_ranks else 0.0
+    baseline_rank = (len(ALL_MODES) + 1) / 2
+    dt_reduction = max(0.0, 1.0 - mean_root_rank / baseline_rank) if root_ranks else 0.0
+
     return Metrics(
         n=n,
         diagnosis_accuracy=diag_correct / n if n else 0.0,
@@ -141,5 +158,7 @@ def compute_metrics(
         recommendation_precision=rec_hits / rec_total if rec_total else 0.0,
         recommendation_n=rec_total,
         abstention_rate=abstained / n if n else 0.0,
+        debugging_time_reduction=dt_reduction,
+        mean_root_rank=mean_root_rank,
         per_mode=per_mode,
     )
