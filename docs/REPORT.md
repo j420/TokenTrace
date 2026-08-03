@@ -1,18 +1,21 @@
 # TokenTrace — Methodology & Results (synthetic benchmark)
 
-> **Scope & honesty note.** Every number below is on a **disjoint synthetic test
-> split** produced by the deterministic mock model + failure-injection harness, with
-> no model or dataset downloads. These results validate the *method and machinery*
-> end-to-end (signal extraction → calibrated ranked diagnosis → causal ordering →
-> validated fix → graceful degradation) and let the ablations isolate each
-> component's contribution. They are **not** real-data performance. Headline numbers
-> on real data require the real backends + datasets (Qwen3-4B / RAGTruth / HotpotQA),
-> which need HuggingFace access; the code paths are wired (`models/{gguf,hf,nnsight}`,
-> `data/loaders`, `retrieval/rag`) and audited but not yet run.
+> **Every number in this document is produced by `python3 scripts/regen_report.py`.**
+> It is regenerated from code, not transcribed, because an earlier revision of this
+> report contained figures that no longer corresponded to any code path. If you
+> change anything that could move a metric, re-run that script and paste its output.
+>
+> **Scope.** These results come from a deterministic mock model and a synthetic
+> failure-injection corpus, with no model or dataset downloads. They validate the
+> *machinery* end-to-end (signal extraction → calibrated ranked diagnosis → causal
+> ordering → validated fix → graceful degradation) and let the ablations isolate each
+> component. They are **not** real-data performance, and §6 lists the specific ways
+> this corpus is easier than reality.
 
-Reproduce: `tokentrace ablate` (or `tokentrace eval`).
+Reproduce: `tokentrace eval`, `tokentrace ablate`, or `scripts/regen_report.py`
+(all three now share one training schedule; they previously did not).
 
-## 1. Method (recap)
+## 1. Method
 
 TokenTrace diagnoses *why* an LLM inference is wrong across five failure modes
 (Prompt Ambiguity, Retrieval Failure, Context Dilution, Hallucination, Reasoning
@@ -20,160 +23,189 @@ Failure) by correlating four signal families (prompt, retrieval, mechanistic,
 confidence) into calibrated, ranked root-cause diagnoses with an auditable evidence
 ledger and a corrective recommendation validated by a simulated intervention.
 
-- **Diagnosis engine:** interpretable likelihood-ratio **rules** produce a log-odds
-  prior; a **LightGBM residual** (rule log-odds as `init_score`) fits only the
-  correction, so the total is one additive ledger `z = prior + rule_Σ + shap_base +
-  shap_Σ`. Cold-start (no data) runs on pure rules.
-- **Calibration:** isotonic per `(mode, missingness-signature)`, fit across all tiers.
-- **Sets:** APS conformal set (adaptive Top-k), excluding hard-masked modes.
-- **Causal:** fixed DAG resolves root vs sequela; a dominant downstream mode stays
-  primary unless a *comparably strong* parent is present.
-- **Supervision:** deterministic failure-injection with verification gates + provenance
-  tiering (synthetic → train, real → eval).
+- **Engine:** interpretable likelihood-ratio **rules** produce a log-odds prior; a
+  **LightGBM residual** (rule log-odds as `init_score`) fits only the correction, so
+  the total is one additive ledger `z = prior + Σrules + shap_base + Σshap`, which
+  the ledger is tested to reconcile to.
+- **Calibration:** per `(mode, missingness-signature)`, **self-validating** — a map
+  is adopted only if it beats the raw sigmoid on held-out Brier score, because on
+  sharp, accurate scores any smoothing map makes probabilities strictly worse.
+  Isotonic on large buckets, Platt on thin ones.
+- **Sets:** APS conformal over *normalized* marginals (the engine emits independent
+  one-vs-rest probabilities, which do not sum to 1).
+- **Supervision:** deterministic failure injection with verification gates that
+  **discard rather than mislabel**; all seven recipes currently pass 100% of gates.
 
-## 2. Experimental setup
+## 2. Setup
 
-- Corpus: injection harness over a 15-fact + 6-multihop seed pool, seeds 0–3, all
-  verification gates enforced. Sizes: **train 205 / cal 68 / test 69** (hash-shuffled,
-  disjoint). Multi-label + causal-edge supervision.
-- Model: deterministic `mock-4b` (coherent generation + confidence + mechanistic
-  proxies). Evaluated at white / grey / black tiers.
-- Targets (from the proposal): diagnosis ≥ 0.80, Top-3 ≥ 0.90, recommendation
-  precision ≥ 0.75.
+- Corpus: **426 rows** from a 16-fact + 6-multihop seed pool, seeds 0–3, gates
+  enforced. Split **255 train / 85 cal / 86 test** (hash-shuffled, disjoint).
+- Labels present: retrieval_failure 112, hallucination 174, context_dilution 64,
+  prompt_ambiguity 56, reasoning_failure 24, and 60 clean (no-failure) rows.
+  Multi-label with causal edges.
+- Model: deterministic `mock-4b`. Targets from the proposal: diagnosis ≥ 0.80,
+  Top-3 ≥ 0.90, recommendation precision ≥ 0.75.
+
+### 2.1 Shortcut audit (run before believing any number below)
+
+A classifier given **only context shape** (chunk count, context length, prompt and
+answer length — zero diagnostic content) scores:
+
+| probe | held-out accuracy |
+|---|---|
+| shape-only features | **0.644** |
+| majority-class prior | 0.356 |
+
+An earlier version of this corpus scored **0.917** here: every recipe had a fixed,
+unique chunk count, so most of the headline metric was recoverable by counting
+chunks. Context geometry is now varied per row, chunk-count bands overlap across
+recipes, and hallucination occurs both with and without retrieval. The **residual
+0.644 is expected and partly legitimate** — context dilution *is* defined by
+geometry (lost-in-the-middle), so a shape probe should find it — but it is also the
+single largest caveat on the numbers below, and it is enforced by a standing test
+(`test_labels_not_recoverable_from_context_shape`).
 
 ## 3. Headline results (per tier)
 
-| tier | diagnosis acc | Top-3 acc | conformal coverage | mean set size | abstention |
-|---|---|---|---|---|---|
-| white-box | **1.000** | 1.000 | 1.000 | 1.00 | 0.130 |
-| grey-box  | **1.000** | 1.000 | 1.000 | 1.00 | 0.130 |
-| black-box | **0.942** | 1.000 | 1.000 | 1.02 | 0.188 |
+| tier | diagnosis | Top-3 | conformal cov. | set size | rec. precision (n, negatives) | healthy abstention | declined | debug-time↓ |
+|---|---|---|---|---|---|---|---|---|
+| white-box | 0.977 | 0.977 | 1.000 | 1.27 | 0.787 (75, 16) | 0.846 | 0.000 | 0.635 |
+| grey-box | 0.977 | 0.977 | 1.000 | 1.27 | 0.787 (75, 16) | 0.846 | 0.000 | 0.635 |
+| black-box | 0.988 | 1.000 | 1.000 | 1.27 | 0.784 (74, 16) | 1.000 | 0.014 | 0.616 |
 
-Top-3 here is the **true** metric (gold root among the 3 highest-probability modes),
-decoupled from the conformal set and the abstention gate. Black-box loses the
-mechanistic family, so diagnosis dips (0.942) and abstention rises (0.130→0.188) —
-the tool becomes *less certain*, by design, rather than wrong.
+All three proposal targets are met. Read the following caveats with the table:
+
+- **The tiers are not distinguishable on this corpus, and white ≡ grey exactly.**
+  `gold_patch_effect` is the only WHITE-exclusive feature; no rule uses it and it
+  does not change the missingness signature, so the two tiers are the same
+  experiment. Black-box scores marginally *higher* here, which is noise on 86 test
+  rows, not evidence that less information helps. **This benchmark does not
+  demonstrate the tier-degradation story**; earlier revisions claimed it did.
+- **Recommendation precision is now non-vacuous**: 16 of 75 scored interventions
+  *failed* to fix the answer. It previously read 1.000 having never observed a
+  single negative, partly because one intervention was counted twice under two
+  names.
+- **Abstention is split** into `healthy_abstention_rate` (correctly silent on a
+  clean row) and `declined_rate` (refused to diagnose a real failure). A combined
+  rate mixes a good behaviour with a bad one.
+- **debugging-time is a ranking proxy with a hard ceiling of 0.667** (= 1 − 1/((K+1)/2)
+  at K=5). 0.635 is close to that ceiling; it is *not* a wall-clock percentage and
+  is not comparable to the proposal's 30–40% target without a user study.
 
 ## 4. Ablations
 
-### 4.1 Learned head — rules-only vs rules ⊕ GBT residual (white-box)
+### 4.1 Learned head (white-box)
 
-| configuration | diagnosis acc | macro-F1 |
+| configuration | diagnosis | macro-F1 |
 |---|---|---|
-| rules only (cold-start) | 0.826 | 0.843 |
-| rules ⊕ GBT residual | **1.000** | **1.000** |
+| rules only (cold start) | 0.814 | 0.767 |
+| rules ⊕ GBT residual | **0.977** | **0.950** |
 
-The interpretable rules alone already clear the 0.80 target (0.826); the learned
-residual sharpens them by **+0.17 accuracy** to 1.000. This is the hybrid design's
-payoff: usable from day one with zero labels, and it improves monotonically as
-labeled data arrives — without discarding the interpretable prior.
+The interpretable rules alone already clear the 0.80 target, and the learned residual
+adds ~0.16. This is the hybrid design's payoff: usable with zero labels, improving
+as labels arrive, without discarding the interpretable prior.
 
-### 4.2 Per-signal-family ablation (drop one family, white-box)
+### 4.2 Per-family ablation — two different questions
 
-Diagnosis accuracy and per-mode F1 when each family's extractors are removed:
+These were previously conflated, which made the published "which family is
+load-bearing" claim an artifact. They are now reported separately.
 
-| dropped family | diagnosis acc | retrieval F1 | dilution F1 | ambiguity F1 | reasoning F1 |
+**(a) Retrained leave-one-family-out** — the family's *information contribution*
+(drop the family, retrain everything):
+
+| dropped family | diagnosis | hallucination F1 |
+|---|---|---|
+| prompt | 1.000 | 1.00 |
+| retrieval | 1.000 | 1.00 |
+| mechanistic | 0.988 | 0.95 |
+| confidence | 1.000 | 1.00 |
+
+**No single family is necessary on this corpus.** Each family independently carries
+enough information to reconstruct the diagnosis — which is itself a finding about the
+corpus (§2.1), not a strength of the method. Only the mechanistic family shows any
+loss, and it is concentrated exactly where theory predicts: the *parametric-override*
+hallucinations, where the gold was retrieved **and attended** yet a parametric belief
+won. That case is behaviourally identical to context dilution and is separable only
+by mechanistic evidence.
+
+**(b) Missing-signal robustness** — how the *shipped* engine copes when a family
+drops out at inference (no retraining):
+
+| dropped family | diagnosis | dilution F1 | halluc. F1 | ambiguity F1 | reasoning F1 | retrieval F1 |
+|---|---|---|---|---|---|---|
+| retrieval | **0.523** | 0.00 | 1.00 | 1.00 | 0.00 | 0.00 |
+| confidence | 0.767 | 1.00 | 0.00 | 1.00 | 0.75 | 1.00 |
+| prompt | 0.861 | 1.00 | 1.00 | 0.00 | 0.75 | 1.00 |
+| mechanistic | 0.988 | 1.00 | 1.00 | 1.00 | 0.75 | 1.00 |
+
+Losing a family at inference degrades exactly the modes that family serves — retrieval
+carries both retrieval-failure and dilution (they share the `gold_recall` discriminator),
+confidence carries hallucination, prompt carries ambiguity. This is the operationally
+useful table; (a) is the scientific one.
+
+### 4.3 Calibration
+
+`ECE 0.0083 → 0.0053`, but **interior mass = 0.012**: only ~1% of predicted
+probabilities lie strictly inside (0.1, 0.9). On a corpus this separable the scores
+are saturated, so ECE is essentially a rescaled error rate and **carries almost no
+calibration information**. It is reported with its interior-mass fraction precisely so
+it cannot be quoted as calibration evidence. The calibrator is self-validating, so
+where a map would hurt it is simply not adopted.
+
+### 4.4 Robustness to observation noise
+
+Deterministic per-observation noise added to the continuous signal features (modelling
+imperfect NLI / embedding / attention estimators); labels stay clean.
+
+| σ | diagnosis | abstention | debug-time↓ | ECE uncal | ECE cal |
 |---|---|---|---|---|---|
-| — (all present) | 1.000 | 1.00 | 1.00 | 1.00 | 1.00 |
-| **retrieval** | **0.522** | 0.00 | 0.00 | 1.00 | 1.00 |
-| **prompt** | 0.754 | 1.00 | 1.00 | 0.00 | 1.00 |
-| mechanistic | 0.942 | 1.00 | 1.00 | 1.00 | 1.00 |
-| confidence | 1.000 | 1.00 | 1.00 | 1.00 | 1.00 |
+| 0.00 | 0.977 | 0.128 | 0.635 | 0.0083 | 0.0053 |
+| 0.25 | 1.000 | 0.151 | 0.654 | 0.0000 | 0.0025 |
+| 0.50 | 1.000 | 0.151 | 0.649 | 0.0035 | 0.0011 |
+| 0.75 | 0.988 | 0.163 | 0.630 | 0.0067 | 0.0109 |
 
-This is the most informative result and it matches the design intent exactly:
-- The **retrieval family is the most load-bearing** (accuracy → 0.522): removing it
-  collapses **both** Retrieval Failure and Context Dilution, because
-  `gold_recall_in_context` is the single decisive discriminator between them.
-- The **prompt family carries Prompt Ambiguity** (its F1 → 0.00 when dropped) and
-  nothing else — a clean, localized dependency.
-- **Mechanistic** contributes at the margin on this (separable) synthetic set
-  (accuracy → 0.942); its value is expected to grow on real, noisier data where the
-  behavioral signals are weaker discriminators.
-- **Confidence** is redundant here (accuracy unchanged) — the other families already
-  separate the modes on clean synthetic data.
-
-### 4.3 Calibration & conformal
-
-Expected Calibration Error over all (example, mode) probabilities:
-`uncalibrated ≈ 0.000`, `calibrated ≈ 0.000`. On a *perfectly separable* synthetic
-corpus the raw scores are already near-perfectly calibrated, so isotonic calibration
-is (correctly) a near-no-op — its value surfaces on noisy/real distributions and
-under tier degradation, where the raw score distribution shifts. Conformal coverage
-is 1.00 at every tier with mean set size ≈ 1.0 (the sets are confident singletons on
-separable data; on real data they will widen on genuinely ambiguous cases).
-
-### 4.4 Recommendations
-
-Recommendation precision is **1.00** (n = 62 scored fixes), now honestly gated: only
-fixes that target a *true* failure mode on a *non-abstained* report are counted.
-**Caveat (from the review):** on the mock this is partly tautological — the simulated
-`add_gold_context` fix injects the reference answer, which the mock then reads. Offline
-it is best read as a *plumbing check* that the intervention loop works; real fix
-efficacy must be measured against a real model.
-
-### 4.5 Debugging-time reduction (proposal target: 30–40%)
-
-Proxy: how far down the ranked differential a developer reads to reach the true root
-cause. Baseline = unaided inspection in no particular order over the 5 modes
-(expected rank (K+1)/2 = 3.0). TokenTrace puts the true root at **mean rank ≈ 1.0**,
-for a **debugging-time reduction of ≈ 0.67 (67%)** — comfortably above the 30–40%
-target. (This is a ranking proxy; the real figure needs the user study in §7. It
-degrades gracefully to ~0.60 under heavy signal noise, §4.6.)
-
-### 4.6 Robustness under observation noise
-
-The synthetic signals are perfectly coherent, which is why the headline numbers
-saturate. To stress the calibration/abstention machinery we add deterministic
-*observation noise* to the continuous signal features (modeling imperfect NLI /
-embedding / attention estimators; labels stay clean). Train and eval both use the
-noisy pipeline.
-
-| noise σ | diagnosis | abstention | debug-time↓ | ECE uncalibrated | ECE calibrated |
-|---|---|---|---|---|---|
-| 0.00 | 1.000 | 0.130 | 0.667 | 0.000 | 0.000 |
-| 0.25 | 0.986 | 0.145 | 0.667 | 0.0029 | 0.0033 |
-| 0.50 | 0.986 | 0.145 | 0.644 | 0.0057 | 0.0053 |
-| 0.75 | 0.942 | **0.188** | 0.600 | 0.0229 | **0.0168** |
-
-Three things the reviewers asked for, now visible:
-1. **Metrics stop saturating** — diagnosis degrades 1.00 → 0.94 as noise rises.
-2. **Abstention adapts** — the engine abstains *more* (0.13 → 0.19) as signals get
-   noisier, i.e. it knows when it's less sure rather than guessing confidently.
-3. **Calibration earns its keep** — at high noise, isotonic calibration cuts ECE by
-   ~27% (0.0229 → 0.0168); at low noise it is (correctly) a near-no-op. This is the
-   behavior the per-signature calibration was designed for.
+**Honest reading: this sweep does not degrade the system.** Accuracy stays within
+noise of 1.00 across the range. The decisive discriminators (`gold_recall_in_context`,
+`is_correct`) are categorical and sit far from their rule thresholds, so ±0.4σ of
+feature noise cannot move them. Abstention does rise monotonically (0.128 → 0.163),
+which is the intended "less certain under noisier evidence" behaviour, but the effect
+is small. An earlier revision presented this sweep as demonstrating graceful
+degradation; it does not.
 
 ## 5. Findings
 
-1. The interpretable rules are strong on their own (0.826) and the learned residual
-   closes the gap to 1.000 — validating the rules ⊕ residual hybrid.
-2. The retrieval family is the backbone (carries 2 of 5 modes via the gold-recall
-   discriminator); prompt carries ambiguity; mechanistic/confidence are supporting on
-   synthetic data.
-3. Degradation is graceful and *self-aware*: black-box drops accuracy modestly and
-   raises abstention rather than producing confident wrong answers.
-4. The ranked differential yields a ~67% debugging-time reduction proxy (root at
-   rank ≈ 1 vs an unaided baseline rank of 3), above the 30–40% target.
-5. Under observation noise the metrics de-saturate, abstention rises, and calibration
-   reduces ECE by ~27% at high noise — the calibration/abstention machinery works as
-   designed, not just on separable data.
+1. The interpretable rules are strong alone (0.814) and the learned residual closes
+   the gap to 0.977 — the hybrid design is validated.
+2. **No signal family is individually necessary on this corpus**, and the mechanistic
+   family's only measurable contribution is on parametric-override hallucination.
+3. At inference time the families are strongly specialised: losing retrieval halves
+   accuracy, and each family's loss maps onto the modes it serves.
+4. Recommendations are validated by simulated intervention and genuinely fail 21% of
+   the time, so the ≥0.75 target is met on a metric that *can* fail.
+5. The observability tiers are **not** distinguished by this benchmark.
 
 ## 6. Threats to validity
 
-- **Synthetic self-consistency.** The mock's signals are internally coherent by
-  construction, so the modes are more separable than real data. This is why several
-  headline metrics saturate at 1.0; the *ablations* (relative contribution) and the
-  *noise sweep* (§4.6, which de-saturates the numbers and exercises calibration) are
-  more meaningful than the absolute headline numbers. It is still a synthetic proxy
-  for real difficulty.
-- **Recommendation tautology** (§4.4).
-- **Real backends unvalidated at runtime** (HF unreachable in the build env). They
-  were audited by a three-reviewer correctness pass and the confirmed defects fixed
-  (see the review-fixes commit), but first-real-run verification is pending.
+- **Residual shape shortcut** (§2.1): shape alone still reaches 0.644 vs a 0.356
+  prior. Partly causal (dilution), partly corpus artifact.
+- **Saturation.** The modes are far more separable than real data; this is why most
+  metrics sit near 1.0, why ECE is uninformative, and why the noise sweep is flat.
+  The *ablations* and the *shortcut probe* are more meaningful than the absolute
+  headline numbers.
+- **White ≡ grey.** The three-tier table reports two distinct conditions.
+- **Recommendation validation is partly circular on the mock**: `add_gold_context`
+  injects text containing the reference answer, which the mock then reads. The
+  negatives are informative; the absolute precision is optimistic.
+- **Real backends are unvalidated at runtime.** `hf`, `gguf` and `nnsight` have never
+  executed (HuggingFace is unreachable in this environment). They were audited and
+  substantially corrected — the nnsight capture path could not complete at all, and
+  gguf would have reserved ~5 GB — but first-real-run verification is still pending.
+- **Small test split** (86 rows): differences under ~0.05 are not meaningful.
 
 ## 7. Next steps
 
-Run the same pipeline on Qwen3-4B (GGUF) with RAGTruth's human hallucination labels +
-a small human-audited multi-label seed as the REAL evaluation split; report per-mode
-precision/recall on real data; and run the debugging-time user study for the 30–40%
-reduction target.
+Run this same pipeline on Qwen3-4B (GGUF) with RAGTruth's human hallucination labels
+plus a human-audited multi-label seed as the REAL evaluation split; report per-mode
+precision/recall on real data; give the white tier a signal no other tier has (a rule
+keyed on `gold_patch_effect`) so the tier comparison becomes a real experiment; and
+run the debugging-time user study the ranking proxy stands in for.
