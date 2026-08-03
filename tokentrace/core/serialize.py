@@ -52,12 +52,24 @@ def inference_to_dict(inf: Inference) -> dict[str, Any]:
     }
 
 
+def _fin(x: Any) -> Any:
+    """NaN/inf -> None.
+
+    ``json.dumps`` emits bare ``NaN``/``Infinity`` tokens, which are NOT valid
+    RFC 8259 JSON: they break ``tokentrace analyze --json`` for any strict consumer
+    and make every cached trace file unparseable by non-Python readers.
+    """
+    if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
+        return None
+    return x
+
+
 def evidence_to_dict(e: EvidenceItem) -> dict[str, Any]:
     return {
         "signal": e.signal,
         "family": e.family.value,
-        "value": e.value,
-        "contribution_logodds": e.contribution_logodds,
+        "value": _fin(e.value),
+        "contribution_logodds": _fin(e.contribution_logodds),
         "direction": e.direction,
         "source": e.source,
         "provenance": e.provenance,
@@ -143,8 +155,8 @@ def evidence_from_dict(d: dict[str, Any]) -> EvidenceItem:
     return EvidenceItem(
         signal=d["signal"],
         family=SignalFamily(d["family"]),
-        value=d["value"],
-        contribution_logodds=d["contribution_logodds"],
+        value=d["value"] if d.get("value") is not None else 0.0,
+        contribution_logodds=d["contribution_logodds"] or 0.0,
         direction=d.get("direction", "supports"),
         source=d.get("source", "rule"),
         provenance=d.get("provenance", {}),

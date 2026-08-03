@@ -127,7 +127,16 @@ class Inference:
 
     @property
     def has_ground_truth(self) -> bool:
-        return self.ground_truth is not None
+        """True only when a USABLE reference is present.
+
+        ``[]`` and ``[""]`` must count as absent: they arrive routinely from a
+        filtered list or a JSON payload, and treating them as present made the
+        scorers return a real 0.0 (rather than "missing"), which diagnosed a
+        perfectly grounded, correct answer as a confident retrieval failure.
+        """
+        if not self.ground_truth:
+            return False
+        return any(g and g.strip() for g in self.ground_truth)
 
     @property
     def query(self) -> str:
@@ -150,6 +159,12 @@ class FeatureVector:
     values: dict[str, float] = field(default_factory=dict)
     missing: set[str] = field(default_factory=set)
     family_present: dict[SignalFamily, bool] = field(default_factory=dict)
+    #: Whether a usable ground-truth reference was available when these features were
+    #: extracted. This is part of the missingness signature because the GT-dependent
+    #: features (is_correct, gold_recall_in_context) live INSIDE already-present
+    #: families, so without it a production (no-reference) trace would silently be
+    #: served a calibration map fitted only on reference-bearing data.
+    reference_available: bool = True
 
     def get(self, name: str) -> Optional[float]:
         if name in self.missing:
@@ -179,7 +194,8 @@ class FeatureVector:
         probabilities stay meaningful under degradation.
         """
         present = [f.value for f in SignalFamily if self.family_present.get(f)]
-        return "+".join(sorted(present)) or "none"
+        sig = "+".join(sorted(present)) or "none"
+        return sig if self.reference_available else f"{sig}|noref"
 
     def to_array(self, feature_names: list[str]) -> "np.ndarray":
         import numpy as np
@@ -236,6 +252,21 @@ class Diagnosis:
     evidence: list[EvidenceItem] = field(default_factory=list)
     confidence: float = 0.0               # per-diagnosis meta-confidence
     recommendations: list[Recommendation] = field(default_factory=list)
+
+    @property
+    def headline_evidence(self) -> "Optional[EvidenceItem]":
+        """Strongest SUBSTANTIVE evidence line.
+
+        The ledger is magnitude-ordered and includes bookkeeping rows (the base-rate
+        prior and the aggregated remainder) so that it reconciles to the total
+        log-odds. Those rows are not explanations, so anything rendering "the reason"
+        should use this rather than ``evidence[0]`` — otherwise a cold-start
+        diagnosis headlines "base rate / prior".
+        """
+        for e in self.evidence:
+            if e.source not in ("prior", "aggregate"):
+                return e
+        return self.evidence[0] if self.evidence else None
 
 
 @dataclass
