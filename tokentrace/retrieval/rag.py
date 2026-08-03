@@ -25,7 +25,6 @@ class RagIndex:
     def build(self) -> "RagIndex":
         try:
             import faiss
-            import numpy as np
             from sentence_transformers import SentenceTransformer
         except ImportError as e:  # pragma: no cover - optional extra
             raise ImportError("RAG needs the 'retrieval' extra: pip install 'tokentrace[retrieval]'") from e

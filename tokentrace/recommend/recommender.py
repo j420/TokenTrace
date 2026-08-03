@@ -20,7 +20,6 @@ from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from tokentrace.core.types import (
-    ALL_MODES,
     Chunk,
     DiagnosisReport,
     DiagnosisRole,

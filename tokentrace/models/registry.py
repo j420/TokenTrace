@@ -91,17 +91,23 @@ def load_model(
         from tokentrace.models.hf import HFModel
 
         return HFModel(profile=profile, tier=tier, **kwargs)
-    raise ValueError(f"unknown backend '{backend}' (mock|gguf|hf)")
+    if backend == "nnsight":
+        from tokentrace.models.nnsight import NNsightModel
+
+        return NNsightModel(profile=profile, tier=tier, **kwargs)
+    raise ValueError(f"unknown backend '{backend}' (mock|gguf|hf|nnsight)")
 
 
 def available_backends() -> dict[str, bool]:
     """Report which real backends are importable in this environment."""
     import importlib.util as u
 
+    _hf = u.find_spec("torch") is not None and u.find_spec("transformers") is not None
     return {
         "mock": True,
         "gguf": u.find_spec("llama_cpp") is not None,
-        "hf": u.find_spec("torch") is not None and u.find_spec("transformers") is not None,
+        "hf": _hf,
+        "nnsight": _hf and u.find_spec("nnsight") is not None,
     }
 
 

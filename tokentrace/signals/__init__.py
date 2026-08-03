@@ -14,6 +14,7 @@ from tokentrace.signals.registry import (
     SignalPipeline,
     default_extractors,
 )
+from tokentrace.signals.model_scorers import ModelScorers
 from tokentrace.signals.scorers import DEFAULT_SCORERS, HeuristicScorers, Scorers
 
 __all__ = [
@@ -31,5 +32,6 @@ __all__ = [
     "MetaExtractor",
     "DEFAULT_SCORERS",
     "HeuristicScorers",
+    "ModelScorers",
     "Scorers",
 ]
