@@ -232,6 +232,9 @@ class SignalPipeline:
     def run(self, inference: Inference, model: ModelHandle) -> FeatureVector:
         bound = model.bound_to(inference)  # keeps mock generation consistent; no-op for real
         fv = FeatureVector()
+        # Recorded up front so it is part of the missingness signature even if no
+        # GT-dependent extractor runs (production path).
+        fv.reference_available = inference.has_ground_truth
         for ex in self.extractors:
             if not ex.applicable(inference, model.tier):
                 continue

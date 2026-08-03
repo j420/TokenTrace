@@ -21,6 +21,11 @@ _WORD = re.compile(r"[a-z0-9]+")
 _PRONOUNS = {"it", "its", "they", "them", "their", "this", "that", "these",
              "those", "he", "she", "him", "her", "his", "one", "there"}
 _VAGUE_TIME = {"recently", "soon", "later", "now", "then", "today", "yesterday"}
+# Function words carry no evidential weight; counting them inflates bag-of-words
+# support/containment for verbose answers.
+_STOP = {"the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or", "is",
+         "was", "were", "are", "be", "been", "by", "with", "from", "as", "that",
+         "this", "it", "its", "into", "about", "than", "then", "there"}
 # Capitalized words that are NOT proper-noun antecedents (question/stop words that
 # can appear capitalized at the start of a sentence).
 _QUESTION_STOP = {"what", "when", "who", "where", "why", "how", "which", "whose",
@@ -50,7 +55,11 @@ class HeuristicScorers:
 
     # -- entailment proxy: is `hypothesis` supported by any of `texts`? -- #
     def support(self, hypothesis: str, texts: list[str]) -> float:
-        h = _tokset(hypothesis)
+        # CONTENT words only: with stop words included, a verbose answer saturates
+        # this score purely on "the/of/is" overlap, and `answer_supported_by_context`
+        # is the gate both hallucination rules key on. Falls back to the raw token
+        # set when an answer is nothing but stop words.
+        h = _tokset(hypothesis) - _STOP or _tokset(hypothesis)
         if not h:
             return 0.0
         best = 0.0
@@ -58,7 +67,9 @@ class HeuristicScorers:
             tt = _tokset(t)
             if not tt:
                 continue
-            # recall of hypothesis content words, with a light idf-free weighting
+            # recall of hypothesis content words, maximised over chunks (a hypothesis
+            # whose tokens are SCATTERED across several unrelated chunks must not
+            # count as supported by any of them)
             overlap = len(h & tt) / len(h)
             best = max(best, overlap)
         return round(best, 4)
@@ -112,6 +123,16 @@ class HeuristicScorers:
 
     # -- answer correctness vs references (token-F1, set-valued refs) -- #
     def match(self, answer: str, references: list[str]) -> float:
+        """Correctness score in [0,1] against a SET of acceptable references.
+
+        Symmetric token-F1 alone punishes a correct answer phrased as a full
+        sentence ("The Eiffel Tower was completed in 1889" vs "1889" scores ~0.3 and
+        would be recorded as *incorrect*), and `is_correct` gates every verification
+        gate and metric downstream. So we also allow CONTAINMENT — the reference's
+        content words all appearing in the answer — but only while the answer stays
+        close to the reference's length, so a rambling answer cannot be scored
+        correct merely for containing the gold tokens somewhere.
+        """
         a = _tokset(answer)
         if not a or not references:
             return 0.0
@@ -124,7 +145,12 @@ class HeuristicScorers:
             if inter == 0:
                 continue
             prec, rec = inter / len(a), inter / len(r)
-            best = max(best, 2 * prec * rec / (prec + rec))
+            f1 = 2 * prec * rec / (prec + rec)
+            rc = r - _STOP or r
+            contained = len(a & rc) / len(rc)
+            if contained >= 1.0 and len(a) <= 4 * len(r) + 5:
+                f1 = max(f1, 1.0)
+            best = max(best, f1)
         return round(best, 4)
 
     # -- semantic entropy over resampled answers (cluster + entropy) -- #
