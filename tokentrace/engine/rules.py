@@ -102,8 +102,11 @@ RULES: list[Rule] = [
     # Geometry: gold buried in the middle of a long, many-chunk context.
     Rule("dil.buried", M.CONTEXT_DILUTION, ("gold_position_frac", "n_chunks", "context_length_tokens"), 1.4,
          SignalFamily.RETRIEVAL,
+         # NB: the token ramp is scaled to the contexts the pipeline actually builds.
+         # It previously started at 200 while the corpus maxed out at 162, so this
+         # rule fired 0/783 times and its log-odds never reached the learned head.
          lambda f: (1 - abs(g(f, "gold_position_frac") - 0.5) * 2) * up(g(f, "n_chunks"), 4, 10)
-                   * up(g(f, "context_length_tokens"), 200, 1500),
+                   * up(g(f, "context_length_tokens"), 60, 400),
          lambda f: f"gold chunk buried mid-context (pos {g(f,'gold_position_frac'):.2f}, {int(g(f,'n_chunks'))} chunks)"),
     # Mechanistic confirmation: model did not attend to the (present) gold chunk.
     Rule("dil.gold_unattended", M.CONTEXT_DILUTION, ("gold_attention_ratio", "gold_recall_in_context"), 1.6,
@@ -130,6 +133,31 @@ RULES: list[Rule] = [
          SignalFamily.CONFIDENCE,
          lambda f: down(g(f, "answer_supported_by_context"), 0.2, 0.5) * up(g(f, "semantic_entropy"), 0.3, 0.8),
          lambda f: f"unsupported answer with high answer spread (semantic entropy {g(f,'semantic_entropy'):.2f})"),
+    # PARAMETRIC OVERRIDE: the gold was retrieved AND attended, yet a parametric
+    # belief won. Mechanically the mirror image of dilution (which has LOW gold
+    # attention and a LATE answer), so this is the discrimination that genuinely
+    # requires mechanistic evidence.
+    Rule("hal.override", M.HALLUCINATION,
+         ("gold_recall_in_context", "gold_attention_ratio", "parametric_knowledge_score",
+          "logit_lens_answer_layer"), 2.4, SignalFamily.MECHANISTIC,
+         lambda f: up(g(f, "gold_recall_in_context"), 0.5, 0.9)
+                   * up(g(f, "gold_attention_ratio"), 0.25, 0.45)
+                   * up(g(f, "parametric_knowledge_score"), 0.6, 0.85)
+                   * down(g(f, "logit_lens_answer_layer"), 0.3, 0.55),
+         lambda f: (f"gold was retrieved and attended ({g(f,'gold_attention_ratio'):.2f}) but the "
+                    f"answer formed early from parametric memory "
+                    f"(param {g(f,'parametric_knowledge_score'):.2f}, layer "
+                    f"{g(f,'logit_lens_answer_layer'):.2f}) — parametric override")),
+    # Non-RAG confabulation: hallucination must be diagnosable with NO retrieval
+    # signals at all (all other hallucination rules require answer_supported_by_context,
+    # which only exists for RAG inputs, so cold-start called every non-RAG
+    # fabrication "healthy").
+    Rule("hal.confab_nonrag", M.HALLUCINATION, ("semantic_entropy", "self_consistency"), 1.8,
+         SignalFamily.CONFIDENCE,
+         lambda f: up(g(f, "semantic_entropy"), 0.35, 0.8) * down(g(f, "self_consistency"), 0.3, 0.7),
+         lambda f: (f"answers disagree across resamples (semantic entropy "
+                    f"{g(f,'semantic_entropy'):.2f}, self-consistency "
+                    f"{g(f,'self_consistency'):.2f}) with no retrieval to ground them")),
 
     # ---------------- Reasoning Failure ---------------- #
     # Info present, multi-hop question, wrong composite answer.

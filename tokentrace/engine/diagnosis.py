@@ -53,18 +53,27 @@ class DiagnosisEngine:
         self.abstain_primary = abstain_primary
 
     # ------------------------------------------------------------------ #
-    def raw_logits(self, fv: FeatureVector, inference: Inference) -> dict[FailureMode, float]:
-        """z_mode = rule_prior + learned_residual, with hard masks applied."""
-        rule_logits, _ = evaluate_rules(fv)
-        residual = self.classifier.residual(fv)
+    def raw_logits(self, fv: FeatureVector, inference: Inference,
+                   rule_logits=None, residual=None) -> dict[FailureMode, float]:
+        """z_mode = rule_prior + learned_residual, with hard masks applied.
+
+        ``rule_logits``/``residual`` may be passed in when the caller has already
+        computed them, so a single diagnosis does not evaluate the rules twice and
+        the LightGBM heads twice.
+        """
+        if rule_logits is None:
+            rule_logits, _ = evaluate_rules(fv)
+        if residual is None:
+            residual = self.classifier.residual(fv)
         z = {m: rule_logits[m] + residual[m] for m in ALL_MODES}
         if not inference.is_rag:
             z[M.RETRIEVAL_FAILURE] = _MASK_LOGIT
             z[M.CONTEXT_DILUTION] = _MASK_LOGIT
         return z
 
-    def probabilities(self, fv: FeatureVector, inference: Inference) -> dict[FailureMode, float]:
-        z = self.raw_logits(fv, inference)
+    def probabilities(self, fv: FeatureVector, inference: Inference,
+                      rule_logits=None, residual=None) -> dict[FailureMode, float]:
+        z = self.raw_logits(fv, inference, rule_logits, residual)
         sig = fv.missingness_signature()
         out = {}
         for m in ALL_MODES:
@@ -79,8 +88,8 @@ class DiagnosisEngine:
     # ------------------------------------------------------------------ #
     def diagnose(self, inference: Inference, fv: FeatureVector, tier: Tier) -> DiagnosisReport:
         rule_logits, fired = evaluate_rules(fv)
-        shap = self.classifier.shap(fv)
-        probs = self.probabilities(fv, inference)
+        residual, shap = self.classifier.contributions(fv)   # one LightGBM pass
+        probs = self.probabilities(fv, inference, rule_logits, residual)
         roles = self.resolver.resolve(probs)
 
         ranked = sorted(ALL_MODES, key=lambda m: -probs[m])
@@ -140,6 +149,11 @@ class DiagnosisEngine:
         elif abstained:
             notes.append("Insufficient evidence to rank a primary cause confidently "
                          f"(diagnostic confidence {diag_conf:.2f}).")
+
+        # Production path: no reference, so nothing can confirm the answer is wrong.
+        if not inference.has_ground_truth:
+            notes.append("No ground-truth reference: these are RISK estimates, not "
+                         "confirmed errors (correctness-dependent evidence is unavailable).")
 
         # Right-answer-for-wrong-reasons / fragile.
         is_correct = fv.get("is_correct")
