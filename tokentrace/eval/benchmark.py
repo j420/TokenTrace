@@ -54,29 +54,36 @@ def train_engine(
     )
     engine = DiagnosisEngine(classifier=clf)
 
-    # 2) fit per-(mode, signature) calibration on the cal split
+    # 2) fit per-(mode, signature) calibration on the cal split, across EVERY tier
+    # that will be evaluated — otherwise the black-box missingness signature is never
+    # fit and transform() falls back to a WHITE-fit map (the miscalibration this is
+    # meant to prevent).
+    cal_tiers = [Tier.WHITE, Tier.GREY, Tier.BLACK]
     records = []
     for li in cal:
-        fv = pipeline.run(li.inference, model)
-        z = engine.raw_logits(fv, li.inference)
-        sig = fv.missingness_signature()
-        yv = dict(zip(ALL_MODES, li.label_vector()))
-        for m in ALL_MODES:
-            if z[m] <= _MASK:            # masked (non-RAG) — nothing to calibrate
-                continue
-            records.append({"mode": m, "signature": sig, "z": z[m], "label": yv[m]})
+        for t in cal_tiers:
+            fv = pipeline.run(li.inference, model.with_tier(t))
+            z = engine.raw_logits(fv, li.inference)
+            sig = fv.missingness_signature()
+            yv = dict(zip(ALL_MODES, li.label_vector()))
+            for m in ALL_MODES:
+                if z[m] <= _MASK:            # masked (non-RAG) — nothing to calibrate
+                    continue
+                records.append({"mode": m, "signature": sig, "z": z[m], "label": yv[m]})
     calibrator = Calibrator().fit(records)
     engine.calibrator = calibrator
 
-    # 3) fit conformal Top-k on the cal split (calibrated probs vs gold primary)
+    # 3) fit conformal on the cal split across the same tiers (tau must reflect the
+    # flatter black-box probability distribution too, not just WHITE).
     prob_rows, gps = [], []
     for li in cal:
-        fv = pipeline.run(li.inference, model)
         gp = gold_primary(li)
         if gp is None:
             continue
-        prob_rows.append(engine.probabilities(fv, li.inference))
-        gps.append(gp)
+        for t in cal_tiers:
+            fv = pipeline.run(li.inference, model.with_tier(t))
+            prob_rows.append(engine.probabilities(fv, li.inference))
+            gps.append(gp)
     engine.conformal = ConformalPredictor().fit(prob_rows, gps)
 
     # 4) attach recommender for eval (simulated-intervention validation)

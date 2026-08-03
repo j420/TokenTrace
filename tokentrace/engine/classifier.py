@@ -83,14 +83,18 @@ class ResidualClassifier:
         for m in ALL_MODES:
             model = self.models.get(m)
             if not model:
-                out[m] = {}
+                out[m] = {"__base__": 0.0}
                 continue
             contrib = model.predict(x, pred_contrib=True)[0]  # [F+1], last = base
-            out[m] = {
+            d = {
                 self.feature_names[j]: float(contrib[j])
                 for j in range(len(self.feature_names))
                 if abs(contrib[j]) > 1e-6
             }
+            # Keep the TreeSHAP base value so the evidence ledger can reconcile to
+            # the full margin (z = rule_prior + base + sum(feature contributions)).
+            d["__base__"] = float(contrib[-1])
+            out[m] = d
         return out
 
     @property

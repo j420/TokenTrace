@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tokentrace.eval.ablations import run_ablations
 from tokentrace.eval.benchmark import (
     evaluate,
     run_reports,
@@ -17,6 +18,7 @@ __all__ = [
     "evaluate",
     "run_reports",
     "split_dataset",
+    "run_ablations",
     "Metrics",
     "compute_metrics",
     "gold_primary",

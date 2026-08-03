@@ -95,7 +95,7 @@ class DiagnosisEngine:
             ))
 
         conformal_set = self.conformal.predict(probs)
-        diag_conf = self._diagnostic_confidence(probs, conformal_set, fv)
+        diag_conf = self._diagnostic_confidence(probs, conformal_set, fv, inference.is_rag)
         top1 = probs[ranked[0]]
         abstained = (top1 < self.abstain_primary) or (diag_conf < self.abstain_confidence)
 
@@ -115,11 +115,16 @@ class DiagnosisEngine:
         mass = sum(abs(e.contribution_logodds) for e in evidence)
         return round(min(1.0, prob * (0.6 + 0.4 * min(1.0, mass / 4.0))), 4)
 
-    def _diagnostic_confidence(self, probs, conformal_set, fv: FeatureVector) -> float:
+    def _diagnostic_confidence(self, probs, conformal_set, fv: FeatureVector,
+                              is_rag: bool = True) -> float:
         ranked = sorted((probs[m] for m in ALL_MODES), reverse=True)
         top1 = ranked[0]
         margin = top1 - (ranked[1] if len(ranked) > 1 else 0.0)
-        family_completeness = sum(1 for f in SignalFamily if fv.family_present.get(f)) / 4.0
+        # Normalize by APPLICABLE families: the retrieval family can never be present
+        # for non-RAG inputs, so dividing by 4 there would unfairly depress confidence.
+        applicable = 4 if is_rag else 3
+        present = sum(1 for f in SignalFamily if fv.family_present.get(f))
+        family_completeness = min(1.0, present / applicable)
         set_penalty = 1.0 / max(1, len(conformal_set))
         conf = top1 * (0.55 + 0.45 * margin) * (0.6 + 0.4 * family_completeness)
         conf *= (0.7 + 0.3 * set_penalty)

@@ -47,7 +47,9 @@ class ConformalPredictor:
         return self
 
     def predict(self, probs: dict[FailureMode, float]) -> list[FailureMode]:
-        ranked = sorted(ALL_MODES, key=lambda m: -probs[m])
+        # Exclude structurally-impossible modes (prob 0, e.g. retrieval modes
+        # hard-masked for non-RAG) so they never pad the set or inflate its size.
+        ranked = [m for m in sorted(ALL_MODES, key=lambda m: -probs[m]) if probs[m] > 0.0]
         out: list[FailureMode] = []
         cum = 0.0
         for m in ranked:
