@@ -49,11 +49,11 @@ class HFModel(ModelHandle):
         self.model = AutoModelForCausalLM.from_pretrained(
             repo,
             torch_dtype=getattr(torch, dtype, torch.float32),
-            output_attentions=True,
-            output_hidden_states=True,
             attn_implementation="eager",  # needed to read attention weights
             **model_kwargs,
         ).to(device).eval()
+        # NB: output_attentions/hidden_states are requested per-forward in capture()
+        # (not globally in config) so generate() doesn't waste memory accumulating them.
         self.device = device
 
         # Fill exact architecture facts from the real config.
@@ -124,7 +124,8 @@ class HFModel(ModelHandle):
         enc_with_off = {**enc, "offset_mapping": offset}
 
         with torch.no_grad():
-            out = self.model(**enc, use_cache=False)
+            out = self.model(**enc, use_cache=False,
+                             output_attentions=True, output_hidden_states=True)
         attentions = out.attentions          # tuple[L] of [1, H, S, S]
         hidden = out.hidden_states           # tuple[L+1] of [1, S, D]
         seq_len = attentions[0].shape[-1]
@@ -186,14 +187,20 @@ class HFModel(ModelHandle):
             norm = getattr(self.model.model, "norm", None)
         except Exception:
             return None, None
+        # hidden[-1] is the post-final-norm state (HF appends it after model.norm),
+        # so it feeds lm_head directly; earlier states are pre-norm residual streams.
         final_logits = lm_head(hidden[-1][0, pos])
         answer_tok = int(final_logits.argmax())
         n = len(hidden) - 1
+        last_idx = len(hidden) - 1
         first_match = None
         matches = 0
         for layer in range(1, len(hidden)):
             h = hidden[layer][0, pos]
-            if norm is not None:
+            # Apply the final norm to pre-norm intermediates only; hidden[-1] is
+            # already normed (applying norm twice — RMSNorm is not idempotent —
+            # would make the final layer spuriously mismatch answer_tok).
+            if norm is not None and layer != last_idx:
                 h = norm(h)
             top = int(lm_head(h).argmax())
             if top == answer_tok:

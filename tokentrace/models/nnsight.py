@@ -9,12 +9,22 @@ Fallback ladder (see ModelProfile.max_tier):
     HookedTransformer -> TransformerBridge -> **NNsight** -> raw HF hooks (models/hf.py) -> grey-box
 
 Grey-box capture (attention-to-context/gold, logit-lens, ReDeEP scores) mirrors the
-HF backend; white-box adds a patched forward that zero-ablates the gold-chunk
-positions' attention and measures the answer-logit drop.
+HF backend; white-box adds an activation-patching pass that zeroes the gold-chunk
+positions in the layer-0 residual stream and measures the drop in the answer-token
+log-prob.
+
+Implementation notes (verify against your pinned nnsight/transformers versions):
+* The model is loaded with ``attn_implementation="eager"`` so attention weights are
+  materialised (SDPA — the >=4.44 default — returns ``None`` for them).
+* Saved proxies are read via ``.value`` after the ``trace`` block.
+* The logit-lens is computed **inside** the trace (Envoy modules only execute in a
+  trace context). Each layer's raw output is pre-final-norm, so ``model.norm`` is
+  applied once to every layer here.
+* Decoder layers are assumed to return a tuple ``(hidden_states, ...)`` (true for the
+  Llama/Qwen/Gemma families); adjust if a version returns a bare tensor.
 
 Lazy imports; needs ``pip install 'tokentrace[mechanistic]'`` (nnsight + torch +
-transformers). Runs on CPU. The exact module paths (``model.model.layers`` etc.)
-follow the Llama/Qwen family; adjust per architecture if needed.
+transformers). Runs on CPU.
 """
 
 from __future__ import annotations
@@ -42,7 +52,9 @@ class NNsightModel(ModelHandle):
                 "NNsight backend needs the 'mechanistic' extra: pip install 'tokentrace[mechanistic]'"
             ) from e
         repo = hf_repo or profile.hf_repo or profile.name
-        self.lm = LanguageModel(repo, device_map=device, dispatch=True, **kwargs)
+        # eager attention so self_attn returns weights (SDPA returns None for them).
+        self.lm = LanguageModel(repo, device_map=device, dispatch=True,
+                                attn_implementation="eager", **kwargs)
         self.tokenizer = self.lm.tokenizer
         self.device = device
         cfg = self.lm.config
@@ -61,38 +73,49 @@ class NNsightModel(ModelHandle):
         with self.lm.generate(prompt, max_new_tokens=max_tokens,
                               do_sample=temperature > 0, temperature=temperature or None):
             out = self.lm.generator.output.save()
-        gen_ids = out[0][len(self.tokenizer(prompt)["input_ids"]):]
+        seq = getattr(out, "value", out)
+        gen_ids = seq[0][len(self.tokenizer(prompt)["input_ids"]):]
         text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
         return GenerationResult(text=text)
 
     # ------------------------------------------------------------------ #
     def capture(self, inference: Inference) -> CaptureResult:
-
         self.require(Tier.GREY)
         enc = self.tokenizer(inference.prompt, return_tensors="pt",
                              return_offsets_mapping=True)
-        ctx_pos, gold_pos = HFModel._context_spans(self, inference,  # reuse span logic
-                                                    {**{k: v for k, v in enc.items()},
-                                                     "offset_mapping": enc["offset_mapping"]})
+        # _context_spans reads only inference.prompt + the offset mapping (not self).
+        ctx_pos, gold_pos = HFModel._context_spans(
+            self, inference, {**{k: v for k, v in enc.items()},
+                              "offset_mapping": enc["offset_mapping"]})
         last = enc["input_ids"].shape[1] - 1
         layers = self.lm.model.layers
+        n = len(layers)
 
         with self.lm.trace(inference.prompt):
-            hidden = [layer.output[0].save() for layer in layers]
-            attn = [layer.self_attn.output[1].save() for layer in layers]  # attn weights
-            final_logits = self.lm.lm_head.output.save()
+            attn_saves = [layer.self_attn.output[1].save() for layer in layers]
+            # logit-lens INSIDE the trace: project each layer's (normed) residual.
+            lens_tok_saves = []
+            for layer in layers:
+                hpos = layer.output[0][0, last]              # tuple output -> hidden_states
+                lens_tok_saves.append(
+                    self.lm.lm_head(self.lm.model.norm(hpos)).argmax(dim=-1).save())
+            final_tok_save = self.lm.lm_head.output[0, last].argmax(dim=-1).save()
 
-        attentions = [a for a in attn]
-        attn_to = HFModel._attention_mass(attentions, last, ctx_pos, self.profile.retrieval_heads or None)
+        attentions = [getattr(a, "value", a) for a in attn_saves]
+        answer_tok = int(getattr(final_tok_save, "value", final_tok_save))
+        lens_tokens = [int(getattr(t, "value", t)) for t in lens_tok_saves]
+
+        attn_to = HFModel._attention_mass(attentions, last, ctx_pos,
+                                          self.profile.retrieval_heads or None)
         gold_attn = (HFModel._attention_mass(attentions, last, gold_pos,
                                              self.profile.retrieval_heads or None)
                      if gold_pos else None)
-        answer_layer, stability = self._logit_lens(hidden, final_logits, last)
+        answer_layer, stability = self._lens_stats(lens_tokens, answer_tok, n)
         external = attn_to
         parametric = min(1.0, max(0.0, 1.0 - external) * (1.0 - (answer_layer or 0.5)) * 2)
 
         result = CaptureResult(
-            n_layers=len(layers),
+            n_layers=n,
             context_attention_ratio=round(attn_to, 3),
             gold_attention_ratio=round(gold_attn, 3) if gold_attn is not None else None,
             logit_lens_answer_layer=answer_layer,
@@ -105,24 +128,21 @@ class NNsightModel(ModelHandle):
         return result
 
     # ------------------------------------------------------------------ #
-    def _logit_lens(self, hidden, final_logits, pos):
-
-        answer_tok = int(final_logits[0, pos].argmax())
-        n = len(hidden)
+    @staticmethod
+    def _lens_stats(lens_tokens: list[int], answer_tok: int, n: int) -> tuple[float, float]:
         first, matches = None, 0
-        for layer in range(n):
-            h = hidden[layer][0, pos]
-            top = int(self.lm.lm_head(self.lm.model.norm(h)).argmax())
-            if top == answer_tok:
+        for i, tok in enumerate(lens_tokens):
+            if tok == answer_tok:
                 matches += 1
-                first = first if first is not None else layer + 1
+                if first is None:
+                    first = i + 1
         answer_layer = (first / n) if first else 1.0
         return round(answer_layer, 3), round(matches / n, 3)
 
     def _patch_gold(self, inference: Inference, gold_pos: list[int]) -> float:
-        """Activation patching: zero the gold positions' residual stream at an early
-        layer and measure the drop in the answer-token logit (causal dependence)."""
-
+        """Activation patching: zero the gold positions in the layer-0 residual
+        stream and measure the drop in the answer-token LOG-PROB (same scale as the
+        HF backend's causal test, so the field is comparable across backends)."""
         answer = inference.generated_answer.strip().split()
         if not answer:
             return 0.0
@@ -131,8 +151,8 @@ class NNsightModel(ModelHandle):
             return 0.0
         tgt = tgt[0]
         with self.lm.trace(inference.prompt):
-            clean = self.lm.lm_head.output[0, -1, tgt].item().save()
+            clean = self.lm.lm_head.output[0, -1].log_softmax(dim=-1)[tgt].save()
         with self.lm.trace(inference.prompt):
             self.lm.model.layers[0].output[0][:, gold_pos, :] = 0
-            ablated = self.lm.lm_head.output[0, -1, tgt].item().save()
-        return round(float(clean) - float(ablated), 3)
+            ablated = self.lm.lm_head.output[0, -1].log_softmax(dim=-1)[tgt].save()
+        return round(float(getattr(clean, "value", clean)) - float(getattr(ablated, "value", ablated)), 3)

@@ -47,7 +47,7 @@ class GGUFModel(ModelHandle):
             model_path=model_path,
             n_ctx=n_ctx,
             n_threads=n_threads,
-            logits_all=False,
+            logits_all=True,   # REQUIRED: llama.cpp rejects logprobs= when this is False
             verbose=False,
             **llama_kwargs,
         )
@@ -61,8 +61,15 @@ class GGUFModel(ModelHandle):
         # Heuristic: pick a Q4_K_M file; callers can pass model_path to be explicit.
         from huggingface_hub import list_repo_files
 
+        import re as _re
+
         files = [f for f in list_repo_files(profile.gguf_repo) if f.lower().endswith(".gguf")]
-        pick = next((f for f in files if "q4_k_m" in f.lower()), files[0])
+        if not files:
+            raise FileNotFoundError(f"no .gguf files in {profile.gguf_repo}; pass model_path=")
+        # Prefer a single-file Q4_K_M; skip multi-part shards (they need merging first).
+        singles = [f for f in files if not _re.search(r"-\d{5}-of-\d{5}", f)]
+        pool = singles or files
+        pick = next((f for f in pool if "q4_k_m" in f.lower()), pool[0])
         return hf_hub_download(profile.gguf_repo, pick)
 
     def generate(
@@ -79,17 +86,29 @@ class GGUFModel(ModelHandle):
         choice = out["choices"][0]
         text = choice["text"]
         lp = choice.get("logprobs") or {}
-        token_texts = lp.get("tokens", []) or []
-        token_logprobs = [x for x in (lp.get("token_logprobs") or []) if x is not None]
-        # Entropy of the next-token distribution from the returned top-k logprobs.
+        # Build the three per-token lists in one aligned pass (drop positions that
+        # lack a logprob, e.g. the first token, from ALL lists so indices stay in
+        # sync — consumers zip them positionally).
+        tokens = lp.get("tokens") or []
+        tlp = lp.get("token_logprobs") or []
+        ttop = lp.get("top_logprobs") or []
+        token_texts: list[str] = []
+        token_logprobs: list[float] = []
         entropies: list[float] = []
-        for top in lp.get("top_logprobs", []) or []:
-            if not top:
+        for i, tok in enumerate(tokens):
+            lpi = tlp[i] if i < len(tlp) else None
+            if lpi is None:
                 continue
-            ps = [math.exp(v) for v in top.values()]
-            z = sum(ps) or 1.0
-            ps = [p / z for p in ps]
-            entropies.append(-sum(p * math.log(p + 1e-12) for p in ps))
+            token_texts.append(tok)
+            token_logprobs.append(float(lpi))
+            top = ttop[i] if i < len(ttop) else None
+            if top:
+                ps = [math.exp(v) for v in top.values()]
+                z = sum(ps) or 1.0
+                ps = [p / z for p in ps]
+                entropies.append(-sum(p * math.log(p + 1e-12) for p in ps))
+            else:
+                entropies.append(0.0)
         return GenerationResult(
             text=text,
             token_texts=token_texts,

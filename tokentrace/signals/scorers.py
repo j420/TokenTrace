@@ -21,6 +21,11 @@ _WORD = re.compile(r"[a-z0-9]+")
 _PRONOUNS = {"it", "its", "they", "them", "their", "this", "that", "these",
              "those", "he", "she", "him", "her", "his", "one", "there"}
 _VAGUE_TIME = {"recently", "soon", "later", "now", "then", "today", "yesterday"}
+# Capitalized words that are NOT proper-noun antecedents (question/stop words that
+# can appear capitalized at the start of a sentence).
+_QUESTION_STOP = {"what", "when", "who", "where", "why", "how", "which", "whose",
+                  "is", "was", "were", "are", "did", "does", "do", "the", "a", "an",
+                  "in", "on", "at", "of", "to", "for"}
 
 
 def norm(text: str) -> list[str]:
@@ -67,24 +72,41 @@ class HeuristicScorers:
 
     # -- prompt ambiguity heuristic in [0,1] -- #
     def ambiguity(self, question: str) -> float:
-        toks = norm(question)
-        if not toks:
+        # Case-preserving word tokens (need capitalization to spot proper nouns).
+        words = re.findall(r"[A-Za-z0-9]+", question)
+        lower = [w.lower() for w in words]
+        if not lower:
             return 0.5
+        content = [w for w in lower if w not in _PRONOUNS]
+
+        pron_positions = [i for i, w in enumerate(lower) if w in _PRONOUNS]
+        n_pron = len(pron_positions)
+
+        def is_proper(i: int) -> bool:
+            # A proper-noun antecedent: capitalized, not sentence-initial, and not a
+            # capitalized question/stop word.
+            return (i > 0 and len(words[i]) >= 3 and words[i][0].isupper()
+                    and lower[i] not in _QUESTION_STOP)
+
+        # An antecedent only counts if it PRECEDES the pronoun — a capitalized unit or
+        # place that comes AFTER the pronoun (Celsius, Moon, Earth) is not one.
+        has_antecedent = bool(pron_positions) and any(
+            is_proper(i) for i in range(pron_positions[0])
+        )
+
         score = 0.0
-        content = [w for w in toks if w not in _PRONOUNS]
-        # 1) unresolved pronouns with no proper-noun antecedent
-        n_pron = sum(1 for w in toks if w in _PRONOUNS)
-        has_proper = bool(re.search(r"\b[A-Z][a-z]{2,}", question[1:]))  # capitalized mid-sentence
-        if n_pron and not has_proper:
-            score += 0.4
+        # 1) an unresolved pronoun (no preceding antecedent) is strong ambiguity on
+        #    its own — weighted to cross the gate regardless of question length.
+        if n_pron and not has_antecedent:
+            score += 0.6
         # 2) underspecified: very few content words
         if len(content) <= 4:
-            score += 0.3
-        # 3) missing named entity entirely
-        if not has_proper:
             score += 0.2
-        # 4) vague temporal language on a 'when' question
-        if any(w in ("when", "how") for w in toks) and any(w in _VAGUE_TIME for w in toks):
+        # 3) no named entity anywhere AND no pronoun (bare underspecified query)
+        if n_pron == 0 and not any(is_proper(i) for i in range(len(words))) and len(content) <= 4:
+            score += 0.2
+        # 4) vague temporal language on a 'when/how' question
+        if any(w in ("when", "how") for w in lower) and any(w in _VAGUE_TIME for w in lower):
             score += 0.1
         return round(min(1.0, score), 4)
 

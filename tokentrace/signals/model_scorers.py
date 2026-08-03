@@ -82,11 +82,18 @@ class ModelScorers(HeuristicScorers):
     def _entail_probs(self, pairs: list[tuple[str, str]]) -> list[float]:
         import numpy as np
 
-        logits = self._nli.predict(pairs, convert_to_numpy=True, apply_softmax=False)
-        logits = np.atleast_2d(logits)
-        e = np.exp(logits - logits.max(axis=1, keepdims=True))
-        soft = e / e.sum(axis=1, keepdims=True)
-        return soft[:, self._entail_idx].tolist()
+        # CrossEncoder.predict kwargs shifted across sentence-transformers 3/4/5;
+        # fall back to a bare call, then softmax only if the output isn't already
+        # a probability distribution.
+        try:
+            scores = self._nli.predict(pairs, convert_to_numpy=True, apply_softmax=False)
+        except TypeError:  # pragma: no cover - version-dependent
+            scores = np.asarray(self._nli.predict(pairs))
+        scores = np.atleast_2d(scores)
+        if scores.shape[1] > 1 and not np.allclose(scores.sum(axis=1), 1.0, atol=0.05):
+            e = np.exp(scores - scores.max(axis=1, keepdims=True))
+            scores = e / e.sum(axis=1, keepdims=True)
+        return scores[:, self._entail_idx].tolist()
 
     def _equiv_nli(self, a: str, b: str) -> bool:
         if " ".join(norm(a)) == " ".join(norm(b)):

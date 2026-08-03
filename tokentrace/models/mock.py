@@ -218,6 +218,15 @@ class MockModel(ModelHandle):
             ctx_attn, gold_attn = 0.18, 0.10
             ext, param = 0.20, 0.82                # low context read, high parametric push
             answer_layer, stability = 0.30, 0.85   # forms early from memory
+        elif dec.ambiguous:
+            # Confident commitment to an alternate reading: the model DOES attend to
+            # the context and forms an answer early and stably (not buried/unattended
+            # like dilution, not late/unstable like reasoning). The tell is high
+            # *semantic* entropy across resamples (in generate), not a mechanistic
+            # dilution signature.
+            ctx_attn, gold_attn = 0.50, 0.40
+            ext, param = 0.55, 0.40
+            answer_layer, stability = 0.40, 0.85
         elif dec.reasoning_failed:
             ctx_attn, gold_attn = 0.5, 0.45
             ext, param = 0.55, 0.5
@@ -240,7 +249,14 @@ class MockModel(ModelHandle):
         # White-box only: causal effect of the gold tokens on the answer.
         gold_patch = None
         if self.supports(Tier.WHITE):
-            gold_patch = 0.8 if dec.grounded else (0.05 if dec.gold_present else 0.02)
+            if dec.grounded:
+                gold_patch = 0.8
+            elif dec.ambiguous:
+                gold_patch = 0.3          # reads context, but the ambiguity is in the query
+            elif dec.gold_present:
+                gold_patch = 0.05
+            else:
+                gold_patch = 0.02
 
         return CaptureResult(
             n_layers=n_layers,

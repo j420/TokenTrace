@@ -181,10 +181,12 @@ class Recommender:
         modified = fn(inference)
 
         if modified is None:
-            # Only path left for hallucination with no retrievable gold: abstain.
+            # Only path left for hallucination with no retrievable gold: recommend
+            # abstaining. We can't verify a correction here (there's nothing to fix
+            # to), so leave it UNSCORED (validated=None) rather than self-crediting —
+            # counting it as a guaranteed hit would inflate recommendation precision.
             if rec.action == "ground_or_abstain":
-                rec.validated = not orig_correct  # abstaining avoids the wrong answer
-                rec.validation_detail = "no gold retrievable — abstaining avoids the fabrication"
+                rec.validation_detail = "no gold retrievable — recommend abstaining (unscored)"
             return
 
         new_answer = self.model.bound_to(modified).generate(modified.prompt).text
