@@ -35,12 +35,21 @@ Retrieval context
 -----------------
 A GenAI span carries the *rendered* prompt, not the retrieval structure — the
 retriever ran in a different span. So context extraction reuses the chat adapter's
-delimited-block heuristic, and every caveat in
+delimited-block heuristic (:func:`openai_chat.extract_all_injected_context`, the
+same call, not a copy of the loop — the two drifted apart once and the same
+first-message-wins bug had to be fixed twice), and every caveat in
 :func:`tokentrace.ingest.openai_chat.extract_injected_context` applies verbatim:
 no scores, no gold flags, guessed chunk boundaries, and undelimited context is not
 extracted at all (the trace comes back non-RAG rather than fabricated). A span
 with no detectable block is treated as a plain chat completion, which is usually
 exactly what it is.
+
+Multiple completions
+--------------------
+A span may log several ``gen_ai.choice`` events / ``gen_ai.completion.<i>``
+attributes. ``generated_answer`` is the **first** one — matching
+``openai_chat``'s ``choices[0]`` — and ``meta['n_choices']`` records how many
+there were. Concatenating them synthesized an answer string no model produced.
 """
 
 from __future__ import annotations
@@ -61,7 +70,7 @@ from tokentrace.ingest.base import (
     register,
     render_messages,
 )
-from tokentrace.ingest.openai_chat import extract_injected_context
+from tokentrace.ingest.openai_chat import extract_all_injected_context
 
 SOURCE = "otel"
 
@@ -322,21 +331,21 @@ def to_inference(payload: Any) -> Inference:
             attrs or payload,
         )
 
-    answer = "\n".join(m["content"] for m in outputs if m.get("content")).strip()
+    # The FIRST choice, exactly as `openai_chat` takes `choices[0]`. Joining them
+    # produced a `generated_answer` no model ever emitted (two `gen_ai.choice`
+    # events for "3+4" and "5+6" became the string "7\n11"), and every correctness,
+    # support and confidence signal was then computed against that composite. The
+    # count is recorded so the dropped samples are auditable rather than invisible.
+    answer = next((m["content"].strip() for m in outputs if m.get("content", "").strip()), "")
     if not answer:
         raise missing_field(SOURCE, "non-empty completion text", _COMPLETION_KEYS, attrs or payload)
 
     prompt = render_messages(inputs)
 
-    texts = [m["content"] for m in inputs]
-    chunks: list[Chunk] = []
-    origin = "none"
-    for i, text in enumerate(texts):
-        found, residual, how = extract_injected_context(text, prefix=f"m{i}c")
-        if found:
-            chunks, origin = found, f"message[{i}]:{how}"
-            texts[i] = residual
-            break
+    # Every input message contributes its blocks; see
+    # `openai_chat.extract_all_injected_context` for why the first-wins loop this
+    # replaces was destroying the answer-bearing chunks.
+    chunks, texts, origin = extract_all_injected_context([m["content"] for m in inputs])
 
     question = ""
     for i in range(len(inputs) - 1, -1, -1):
@@ -384,6 +393,9 @@ def to_inference(payload: Any) -> Inference:
                 "provider": system or None,
                 "otel_form": form,
                 "span_name": content_text(first_present(payload, ("name",))) or None,
+                # Only when the span logged more than one sample, so the discarded
+                # ones are visible instead of silently gone.
+                "n_choices": len(outputs) if len(outputs) > 1 else None,
             },
         ),
         id=span_id or None,

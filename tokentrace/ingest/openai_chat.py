@@ -26,10 +26,18 @@ was injected, in this order:
 1. ``<context> ... </context>`` (or ``<documents>``/``<passages>``) wrappers;
 2. repeated ``<document id="...">...</document>`` tags;
 3. a ``Context:`` / ``Retrieved documents:`` / ``Sources:`` header line, with the
-   block running to the next section header (``Question:``, ``Instructions:``, ...).
+   block running to the next section header (``Question:``, ``Instructions:``, ...)
+   or, when there is none, to the end of the message minus a trailing instruction
+   *about* the block ("Answer using only the context above.", see
+   :data:`_TRAILING_INSTRUCTION`) — which otherwise ended up inside the last chunk
+   and was scored as retrieved evidence.
 
-Inside a block, entries are split on explicit markers (``[1]``, ``1.``, ``- ``,
+Inside a block, entries are split on explicit markers (``[1]``, ``1.``,
 ``Document 3:``), else on rule separators (``---``), else on blank lines.
+:func:`extract_all_injected_context` applies that to **every** input message and
+concatenates the results, because a RAG prompt routinely splits the block across
+turns (retrieved facts in the system message, more retrieved facts plus the
+question in the user message).
 
 Limits, stated plainly — every one of these is a *silent* wrong answer, so the
 strategy that was actually used is recorded in
@@ -42,7 +50,11 @@ strategy that was actually used is recorded in
 * **Chunk boundaries are guessed.** Blank-line splitting turns one multi-paragraph
   document into several chunks. ``n_chunks``, ``context_length_tokens`` and the
   dilution geometry (``gold_position_frac``) are therefore approximations, and
-  ``dil.buried`` in particular keys on exactly those.
+  ``dil.buried`` in particular keys on exactly those. Both known ways for that
+  guess to go badly wrong are bounded rather than merely documented: bare
+  markdown bullets are **not** treated as document boundaries (see
+  :data:`_ENTRY_MARKER`) and no single block may exceed
+  :data:`_MAX_BLOCK_CHUNKS` chunks.
 * **No scores, ever.** A rendered prompt cannot carry retriever scores, so
   ``retriever_scores`` is always ``absent`` for this adapter.
 * **No gold flags, ever.** Nothing in a chat log says which document bore the
@@ -52,6 +64,9 @@ strategy that was actually used is recorded in
 * **False positives on quoted user content.** A summarization prompt whose user
   turn is ``Documents: <the user's own text>`` is read as RAG.
 * **The prompt is a reconstruction.** The provider's chat template is not logged.
+* **Only the first completion.** ``choices[0]`` is the answer; a payload logging
+  ``n>1`` samples has the rest dropped rather than concatenated into a string no
+  model produced.
 
 If any of this matters for your pipeline, log the retrieval structure and use the
 :mod:`~tokentrace.ingest.langchain` / :mod:`~tokentrace.ingest.llamaindex` /
@@ -122,15 +137,58 @@ _NEXT_SECTION = re.compile(
 
 _SEPARATOR = re.compile(r"^[ \t]*(?:-{3,}|={3,}|\*{3,}|_{3,})[ \t]*$", re.MULTILINE)
 
+#: What counts as "a new retrieved document starts here" inside a context block.
+#:
+#: Bare markdown bullets (``- ``, ``* ``, ``• ``) are deliberately NOT in this set.
+#: Unlike ``[1]`` / ``(1)`` / ``1.`` / ``Document 3:`` a bullet carries no document
+#: *identity*, so it is indistinguishable from ordinary list formatting inside a
+#: single retrieved document — and it was measurably not harmless: one document
+#: containing a five-item bulleted list became six chunks with
+#: ``gold_position_frac=0.2`` while the identical text written as prose stayed one
+#: chunk, and ``rules.dil.buried`` keys on exactly ``n_chunks`` +
+#: ``gold_position_frac``. That made the *formatting* of a log change the dilution
+#: diagnosis. Merging a bulleted list back into one chunk loses boundary detail but
+#: loses no text and cannot manufacture that geometry, which is the only error
+#: direction that does not make the engine confidently wrong. Pipelines that really
+#: do delimit their documents still split on tags, numbers and ``---`` rules.
 _ENTRY_MARKER = re.compile(
     r"^[ \t]*(?:"
     r"\[(?P<bracket>[^\]\n]{1,60})\]"                                   # [1]  [doc-3]
     r"|\((?P<paren>\d{1,3})\)"                                          # (1)
     r"|(?P<num>\d{1,3})[.)]"                                            # 1.  1)
     r"|(?:document|doc|source|passage|chunk|excerpt)[ \t]+(?P<named>[^\s:.\n]{1,40})[ \t]*[:.]"
-    r"|[-*•][ \t]"                                                 # - bullet
     r")[ \t]*",
     re.IGNORECASE | re.MULTILINE,
+)
+
+#: Upper bound on the chunks ONE block may be split into. A 20,000-line numbered
+#: list produced 20,000 ``Chunk`` objects — an O(n) blow-up through every retrieval
+#: signal and a ``dil.buried`` geometry computed over noise. Over the cap the block
+#: degrades to a SINGLE chunk rather than being truncated: coarser boundaries, but
+#: no text dropped, because dropping retrieved text is what fabricates a retrieval
+#: failure.
+#:
+#: Deliberately far above any plausible top-k. The cap exists to bound a log line
+#: that is really a data dump, NOT to second-guess a large retrieval set: collapsing
+#: a genuine 100-document context would drive ``n_chunks`` from 100 to 1 and switch
+#: ``dil.buried``'s ``up(n_chunks, 4, 10)`` term from saturated to zero — suppressing
+#: the dilution geometry in exactly the case most likely to be dilution.
+_MAX_BLOCK_CHUNKS = 512
+
+#: A trailing line that instructs the model *about* the block it follows
+#: ("Answer using only the context above."). Matched only against the LAST line of
+#: a block. Both halves are required — an imperative AND a reference to the context
+#: itself — because the cost of a false positive here is deleting real retrieved
+#: text, which is strictly worse than leaving one instruction line inside the final
+#: chunk.
+_TRAILING_INSTRUCTION = re.compile(
+    r"^[ \t]*(?:answer|respond|reply|cite|quote|summari[sz]e|use|using|based|"
+    r"refer|do not|don't|only use|only answer|if the)\b"
+    r"[^\n]{0,200}?"
+    r"\b(?:context|contexts|document|documents|passage|passages|source|sources|"
+    r"excerpt|excerpts|above|below)\b"
+    r"[^\n]{0,200}$",
+    re.IGNORECASE,
 )
 
 
@@ -142,40 +200,75 @@ def _marker_id(match: "re.Match[str]") -> str:
     return ""
 
 
-def _split_block(body: str, builder: ChunkBuilder, prefix: str) -> str:
-    """Split one context block into chunks. Returns the strategy used."""
+def _block_entries(body: str, prefix: str) -> tuple[list[tuple[str, str]], str]:
+    """Candidate ``(text, source_id)`` entries for one block + the strategy used."""
     doc_tags = list(_DOC_TAG.finditer(body))
     if doc_tags:
+        entries = []
         for i, match in enumerate(doc_tags):
             attrs = dict(_TAG_ATTR.findall(match.group("attrs") or ""))
             source_id = attrs.get("id") or attrs.get("source") or attrs.get("name") or f"{prefix}{i}"
-            builder.add(match.group("body"), source_id=source_id)
-        return "document_tags"
+            entries.append((match.group("body"), source_id))
+        return entries, "document_tags"
 
     markers = list(_ENTRY_MARKER.finditer(body))
     if markers:
         bounds = [m.start() for m in markers] + [len(body)]
         # Text BEFORE the first marker is retrieved context too, and dropping it is
-        # not a harmless omission: the layout "Context:\n<lead-in sentence>\n- fact"
+        # not a harmless omission: the layout "Context:\n<lead-in sentence>\n[1] fact"
         # is ordinary, and if the answer lives in that lead-in the engine sees a
         # confident gold_recall_in_context = 0.0 — a measured zero, not a missing
         # value — and reports a retrieval failure for a trace where retrieval
         # actually worked. Fabricating evidence is worse than losing it.
-        builder.add(body[: markers[0].start()], source_id=f"{prefix}pre")
+        entries = [(body[: markers[0].start()], f"{prefix}pre")]
         for i, match in enumerate(markers):
-            text = body[match.end() : bounds[i + 1]]
-            builder.add(text, source_id=_marker_id(match) or f"{prefix}{i}")
-        return "entry_markers"
+            entries.append((body[match.end() : bounds[i + 1]], _marker_id(match) or f"{prefix}{i}"))
+        return entries, "entry_markers"
 
     if _SEPARATOR.search(body):
-        for i, part in enumerate(_SEPARATOR.split(body)):
-            builder.add(part, source_id=f"{prefix}{i}")
-        return "rule_separators"
+        return ([(part, f"{prefix}{i}") for i, part in enumerate(_SEPARATOR.split(body))],
+                "rule_separators")
 
     paragraphs = [p for p in re.split(r"\n[ \t]*\n", body) if p.strip()]
-    for i, part in enumerate(paragraphs):
-        builder.add(part, source_id=f"{prefix}{i}")
-    return "blank_line_split" if len(paragraphs) > 1 else "whole_block"
+    return ([(part, f"{prefix}{i}") for i, part in enumerate(paragraphs)],
+            "blank_line_split" if len(paragraphs) > 1 else "whole_block")
+
+
+def _split_block(body: str, builder: ChunkBuilder, prefix: str) -> str:
+    """Split one context block into chunks. Returns the strategy used."""
+    entries, strategy = _block_entries(body, prefix)
+    if len(entries) > _MAX_BLOCK_CHUNKS:
+        entries, strategy = [(body, f"{prefix}0")], f"{strategy}_capped"
+    for text, source_id in entries:
+        builder.add(text, source_id=source_id)
+    return strategy
+
+
+def _split_trailing_instruction(body: str) -> tuple[str, str]:
+    """Split a trailing "Answer using only the context above." off a block body.
+
+    Returns ``(body, trailing)``; ``trailing`` is ``""`` when nothing matched. The
+    trailing line is handed back to the *residual* (and so to ``question`` and the
+    prompt), never discarded — it is a real part of the message, just not a
+    retrieved document.
+
+    A single-line block is left alone, and a block that is *nothing but* the
+    instruction ends up with an empty body — which is not a hole: ``_split_block``
+    then produces no chunks, :func:`extract_injected_context` falls through to
+    ``origin="none"``, and the whole message stays in the residual. A "Context:"
+    header followed only by an instruction genuinely carries no documents, so
+    reporting the trace as non-RAG is the correct answer rather than a lost one.
+    """
+    stripped = body.rstrip()
+    cut = stripped.rfind("\n")
+    if cut < 0:                       # a one-line block has no "trailing" line
+        return body, ""
+    last = stripped[cut + 1 :]
+    if _ENTRY_MARKER.match(last):     # it is an entry of the block, not a note about it
+        return body, ""
+    if not _TRAILING_INSTRUCTION.match(last):
+        return body, ""
+    return stripped[:cut], last.strip()
 
 
 def extract_injected_context(text: str, prefix: str = "ctx") -> tuple[list[Chunk], str, str]:
@@ -196,25 +289,59 @@ def extract_injected_context(text: str, prefix: str = "ctx") -> tuple[list[Chunk
 
     doc_tags = list(_DOC_TAG.finditer(text))
     if doc_tags:
-        for i, match in enumerate(doc_tags):
-            attrs = dict(_TAG_ATTR.findall(match.group("attrs") or ""))
-            source_id = attrs.get("id") or attrs.get("source") or attrs.get("name") or f"{prefix}{i}"
-            builder.add(match.group("body"), source_id=source_id)
+        # Via _split_block so the chunk cap applies here too. It is the only splitting
+        # path that used to bypass it, and an unbounded path next to three bounded
+        # ones is the kind of inconsistency that gets found the hard way.
+        span = text[doc_tags[0].start() : doc_tags[-1].end()]
+        strategy = _split_block(span, builder, prefix)
         if builder.chunks:
             residual = (text[: doc_tags[0].start()] + "\n" + text[doc_tags[-1].end() :]).strip()
-            return builder.chunks, residual, "document_tags/document_tags"
+            return builder.chunks, residual, f"document_tags/{strategy}"
 
     header = _HEADER.search(text)
     if header:
         start = header.end()
         following = _NEXT_SECTION.search(text, start)
         end = following.start() if following else len(text)
-        strategy = _split_block(text[start:end], builder, prefix)
+        # A header block with no following section header runs to end of message, so
+        # "Answer using only the context above." was landing inside the last chunk.
+        body, trailing = _split_trailing_instruction(text[start:end])
+        strategy = _split_block(body, builder, prefix)
         if builder.chunks:
-            residual = (text[: header.start()] + "\n" + text[end:]).strip()
+            residual = "\n".join(
+                part for part in (text[: header.start()], trailing, text[end:]) if part.strip()
+            ).strip()
             return builder.chunks, residual, f"header/{strategy}"
 
     return [], text, "none"
+
+
+def extract_all_injected_context(texts: Sequence[str]) -> tuple[list[Chunk], list[str], str]:
+    """Apply :func:`extract_injected_context` to EVERY message, not just the first.
+
+    Returns ``(chunks, residual texts, origin)``.
+
+    Stopping at the first message carrying a block was a silent data-destroying
+    bug, not an optimization: for the ordinary layout "retrieved facts in the
+    system turn, more retrieved facts plus the question in the user turn" it kept
+    the system turn's chunks, **discarded the user turn's entirely** (including the
+    answer-bearing one), and then left that undetected block sitting in
+    ``question`` as raw context prose. The engine therefore saw a measured
+    ``gold_recall_in_context`` of 0.0 over a context that did contain the answer,
+    plus a question polluted with a context blob — a confident retrieval failure
+    for a trace where retrieval worked.
+    """
+    chunks: list[Chunk] = []
+    residuals = list(texts)
+    origins: list[str] = []
+    for i, text in enumerate(texts):
+        found, residual, how = extract_injected_context(text, prefix=f"m{i}c")
+        if not found:
+            continue
+        chunks.extend(found)
+        residuals[i] = residual
+        origins.append(f"message[{i}]:{how}")
+    return chunks, residuals, "+".join(origins) or "none"
 
 
 # --------------------------------------------------------------------------- #
@@ -329,16 +456,9 @@ def to_inference(payload: Any) -> Inference:
         raise missing_field(SOURCE, "non-empty prompt text in the messages array",
                             _MESSAGE_PATHS, payload)
 
-    # Scan every input message; the first one carrying a delimited block wins.
-    texts = [message_text(m) for m in inputs]
-    chunks: list[Chunk] = []
-    origin = "none"
-    for i, text in enumerate(texts):
-        found, residual, how = extract_injected_context(text, prefix=f"m{i}c")
-        if found:
-            chunks, origin = found, f"message[{i}]:{how}"
-            texts[i] = residual
-            break
+    # Every input message contributes its delimited blocks (see the function's
+    # docstring for why stopping at the first one destroyed retrieval evidence).
+    chunks, texts, origin = extract_all_injected_context([message_text(m) for m in inputs])
 
     user_index = _last_user_index(inputs)
     question = texts[user_index].strip() if user_index is not None else ""
