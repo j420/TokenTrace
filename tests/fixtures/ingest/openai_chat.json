@@ -1,0 +1,33 @@
+{
+  "id": "chatcmpl-tt-openai-0001",
+  "provider": "openai",
+  "request": {
+    "model": "gpt-4o-mini",
+    "temperature": 0.0,
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a support assistant for the Widgetworks returns desk. Answer only from the context below.\n\nContext:\n[kb-101] Standard returns are accepted within 30 days of delivery for unopened items.\n[kb-102] Refunds are issued to the original payment method within 5 business days of receipt.\n[kb-103] The Widgetworks warehouse is located in Rotterdam and is open on weekdays.\n\nInstructions: cite the knowledge-base id you used."
+      },
+      {
+        "role": "user",
+        "content": "How long do I have to return an unopened widget?"
+      }
+    ]
+  },
+  "response": {
+    "id": "chatcmpl-tt-openai-0001",
+    "model": "gpt-4o-mini",
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": "stop",
+        "message": {
+          "role": "assistant",
+          "content": "You have 30 days from delivery to return an unopened item [kb-101]."
+        }
+      }
+    ],
+    "usage": {"prompt_tokens": 141, "completion_tokens": 19}
+  }
+}

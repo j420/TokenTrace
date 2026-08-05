@@ -1,0 +1,41 @@
+{
+  "tokentrace_field_map": {
+    "id": "trace.id",
+    "model": "config.model",
+    "question": "input.user_message",
+    "prompt": "input.rendered_prompt",
+    "answer": "output.completion",
+    "chunks": "retrieval.hits[].passage",
+    "chunk_scores": "retrieval.hits[].similarity",
+    "chunk_source_ids": "retrieval.hits[].doc_id"
+  },
+  "trace": {"id": "row-90211"},
+  "config": {"model": "internal-llm-v3", "temperature": 0.0},
+  "input": {
+    "user_message": "What is the response target for a priority-one incident?",
+    "rendered_prompt": "SYSTEM: Answer from the runbook excerpts.\n\nEXCERPTS:\nA priority-one incident must receive a first response within 15 minutes, around the clock.\nPriority-two incidents have a first-response target of four business hours.\nThe on-call rota is published every Friday for the following week.\n\nUSER: What is the response target for a priority-one incident?"
+  },
+  "output": {
+    "completion": "A priority-one incident must get a first response within 15 minutes, 24/7.",
+    "finish_reason": "stop"
+  },
+  "retrieval": {
+    "hits": [
+      {
+        "doc_id": "runbook#sla-p1",
+        "similarity": 0.912,
+        "passage": "A priority-one incident must receive a first response within 15 minutes, around the clock."
+      },
+      {
+        "doc_id": "runbook#sla-p2",
+        "similarity": 0.478,
+        "passage": "Priority-two incidents have a first-response target of four business hours."
+      },
+      {
+        "doc_id": "runbook#oncall",
+        "similarity": null,
+        "passage": "The on-call rota is published every Friday for the following week."
+      }
+    ]
+  }
+}

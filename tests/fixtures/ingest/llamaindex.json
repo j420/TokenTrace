@@ -1,0 +1,30 @@
+{
+  "query_str": "What is the escalation path for a delayed shipment?",
+  "response": "Delayed shipments are escalated to the regional logistics lead after 48 hours.",
+  "metadata": {"llm": "local-qwen3-4b"},
+  "source_nodes": [
+    {
+      "score": 0.7421,
+      "node": {
+        "id_": "3c9f1a2e-0b44-4f2a-9a51-2d0d7c1b8e00",
+        "text": "If a shipment is delayed by more than 48 hours the case is escalated to the regional logistics lead, who owns the carrier relationship.",
+        "metadata": {"file_name": "ops_runbook.md", "section": "escalations"}
+      }
+    },
+    {
+      "score": 0.6013,
+      "node": {
+        "id_": "8b7d5c40-1e33-4d92-91aa-77f0a1c2b311",
+        "text": "Carrier relationships are reviewed quarterly by the logistics team; the regional lead chairs the review.",
+        "metadata": {"file_name": "ops_runbook.md", "section": "reviews"}
+      }
+    },
+    {
+      "node": {
+        "id_": "f10c9a77-52ab-4c19-8bd0-5e6a4f31d902",
+        "text": "The onboarding checklist for new warehouse staff covers safety equipment and shift handover.",
+        "metadata": {"file_name": "hr_onboarding.md"}
+      }
+    }
+  ]
+}

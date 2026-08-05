@@ -1,0 +1,36 @@
+{
+  "name": "chat claude-haiku-4-5",
+  "kind": "SPAN_KIND_CLIENT",
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span_id": "b7ad6b7169203331",
+  "attributes": {
+    "gen_ai.system": "anthropic",
+    "gen_ai.operation.name": "chat",
+    "gen_ai.request.model": "claude-haiku-4-5",
+    "gen_ai.usage.output_tokens": 24
+  },
+  "events": [
+    {
+      "name": "gen_ai.system.message",
+      "attributes": {
+        "role": "system",
+        "content": "Answer using only the retrieved passages.\n\nRetrieved documents:\n1. The Antwerp depot processes returns only and does not handle outbound freight.\n2. Outbound freight leaves the Rotterdam warehouse every weekday at 06:00.\n\nInstructions: answer in one sentence and name the site."
+      }
+    },
+    {
+      "name": "gen_ai.user.message",
+      "attributes": {
+        "role": "user",
+        "content": "When does outbound freight leave?"
+      }
+    },
+    {
+      "name": "gen_ai.choice",
+      "attributes": {
+        "finish_reason": "end_turn",
+        "index": 0,
+        "message": "{\"role\": \"assistant\", \"content\": \"Outbound freight leaves the Rotterdam warehouse every weekday at 06:00.\"}"
+      }
+    }
+  ]
+}
