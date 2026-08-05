@@ -213,6 +213,58 @@ def test_report_json_is_strictly_valid(model, pipeline):
         AssertionError(f"non-RFC-8259 token in output: {c}")))
 
 
+def _strict(blob: str) -> None:
+    json.loads(blob, parse_constant=lambda c: (_ for _ in ()).throw(
+        AssertionError(f"non-RFC-8259 token in output: {c}")))
+
+
+def test_every_float_field_in_a_report_is_scrubbed(model, pipeline):
+    """Poke a non-finite value into each float field IN TURN.
+
+    Strict-JSON validity is a whole-document property — one unscrubbed field poisons
+    the entire blob — so a guard built from a *healthy* report cannot observe a gap in
+    the sweep. That is exactly what happened: `probability`, `confidence` and
+    `diagnostic_confidence` were missed by `_fin` for as long as the only guard used a
+    report whose values all happened to be finite.
+    """
+    inf = observe(model, Inference(
+        "When was the Eiffel Tower completed?\nParis is in France.", "",
+        [Chunk("Paris is in France.", 0.5, "d2")], ["1889"],
+        question="When was the Eiffel Tower completed?",
+        meta={"_sim": {"answer": "1889", "gold_fact": "1889", "distractor": "1920"}}))
+    base = DiagnosisEngine().diagnose(inf, pipeline.run(inf, model), model.tier)
+    assert base.diagnoses and base.diagnoses[0].evidence, "need a populated report"
+
+    pokes = {
+        "report.diagnostic_confidence":
+            lambda r, v: setattr(r, "diagnostic_confidence", v),
+        "diagnosis.probability":
+            lambda r, v: setattr(r.diagnoses[0], "probability", v),
+        "diagnosis.confidence":
+            lambda r, v: setattr(r.diagnoses[0], "confidence", v),
+        "evidence.value":
+            lambda r, v: setattr(r.diagnoses[0].evidence[0], "value", v),
+        "evidence.contribution_logodds":
+            lambda r, v: setattr(r.diagnoses[0].evidence[0], "contribution_logodds", v),
+    }
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        for name, poke in pokes.items():
+            report = DiagnosisEngine().diagnose(inf, pipeline.run(inf, model), model.tier)
+            poke(report, bad)
+            try:
+                _strict(json.dumps(report_to_dict(report)))
+            except AssertionError as exc:
+                raise AssertionError(f"{name} is not scrubbed ({bad!r}): {exc}") from exc
+
+
+def test_a_non_finite_retriever_score_does_not_poison_the_trace_json():
+    """Same property on the inference side, which the cache persists."""
+    from tokentrace.core.serialize import inference_to_dict
+
+    inf = Inference("p", "a", [Chunk("x", float("nan"), "d1")], ["gt"], question="q")
+    _strict(json.dumps(inference_to_dict(inf)))
+
+
 # --------------------------------------------------------------------------- #
 # Injection gates must not systematically discard a slice of the corpus
 # --------------------------------------------------------------------------- #
