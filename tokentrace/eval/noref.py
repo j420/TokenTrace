@@ -24,6 +24,18 @@ you will never have references.
 Both are reported against the reference-bearing baseline, so the delta is
 explicit rather than inferred.
 
+**(c) frozen-mock transfer** — the same strip as (a), but with the simulated
+model's decision *pinned* to the one it made on the reference-bearing original.
+This is the artifact-controlled figure and the one the report should quote as the
+production estimate; see :func:`freeze_mock_decisions` for why (a) is not.
+
+**(d) black-box x no-reference** — (a) and (c) re-scored at :attr:`Tier.BLACK`.
+(a)-(c) vary only the reference dimension while keeping full white-box mechanistic
+capture, but a trace arriving through :mod:`tokentrace.ingest` has *neither* a
+reference *nor* activations. Calling (a) "the operating mode the product will
+actually run in" was therefore an assumption about one axis and a claim about two;
+this condition measures the second axis instead of assuming it.
+
 Metrics that cannot be computed without a reference are returned as the explicit
 :data:`UNAVAILABLE` marker, never as 0.0 — see
 :data:`GROUND_TRUTH_DEPENDENT_METRICS` for which ones and why.
@@ -34,8 +46,9 @@ its dilution trigger depends on that), so removing the annotation changes the
 *simulated model's* behaviour — which cannot happen in production, where a real
 model never sees an annotation in the first place. ``confound_controls`` in
 :func:`run_noref` therefore reports two half-strips that remove one thing each,
-plus a count of how many rows the mock re-decides, so the headline drop can be
-attributed rather than assumed.
+plus a count of how many rows the mock re-decides; the ``frozen_mock`` block then
+*scores* the strip against an unchanged simulated model, so the artifact's cost is
+measured rather than inferred from the half-strips.
 
 Scope caveat, stated up front: the *labels* survive stripping because they come
 from the injection harness, not from the reference. But those labels were only
@@ -158,11 +171,24 @@ def strip_reference(obj: _StripTarget, *, drop_gold_flags: bool = True,
     production value, but every consumer in the codebase tests ``gold`` for plain
     truthiness (``if c.gold``, ``[c for c in chunks if c.gold]``), so the two are
     behaviourally identical and ``False`` states the intent unambiguously.
+
+    ``LabeledInference.verification`` is cleared alongside the reference. It holds
+    the injection gate's readings — ``{'gate_passed': True, 'is_correct': 1.0,
+    'gold_recall': ...}`` — which are GT-derived by construction, so leaving them on
+    an object this function documents as "the shape a production trace arrives in"
+    was a contradiction. Nothing on the signal or metrics path reads the field
+    today, so this changes no number; it removes residue that a future reader (or a
+    future feature) could mistake for legitimately available evidence. The
+    *labels* are kept for the reason above — they are supervision, not reference —
+    and the recipe name is kept because ``run_noref`` reports the mock's re-decisions
+    per recipe.
     """
     stripped = copy.deepcopy(obj)
     inference = stripped.inference if isinstance(stripped, LabeledInference) else stripped
     if drop_ground_truth:
         inference.ground_truth = None
+        if isinstance(stripped, LabeledInference):
+            stripped.verification = {}
     if drop_gold_flags:
         for chunk in inference.retrieved_context or ():
             chunk.gold = False
@@ -172,6 +198,76 @@ def strip_reference(obj: _StripTarget, *, drop_gold_flags: bool = True,
 def strip_dataset(dataset: list[LabeledInference], **kwargs) -> list[LabeledInference]:
     """:func:`strip_reference` over a whole split, preserving order."""
     return [strip_reference(li, **kwargs) for li in dataset]
+
+
+# --------------------------------------------------------------------------- #
+# The mock-artifact control
+# --------------------------------------------------------------------------- #
+def _decision_key(inference: Inference) -> tuple:
+    """Identity of a trace *as the simulated model sees it*, minus the reference.
+
+    Everything ``MockModel._decide`` branches on except ``Chunk.gold`` and
+    ``ground_truth``: the rendered prompt, the chunk texts in order, and the
+    ``_sim`` world-model hints. Those two exclusions are the point — they are what
+    stripping removes, so including them would give a trace and its stripped copy
+    different keys and make the freeze a silent no-op.
+
+    Everything else is included so a *counterfactual* stays a different trace. The
+    recommender's interventions rebuild the prompt, the chunk list and ``_sim``
+    (``clarify_prompt`` and ``decompose_question`` change ``_sim`` alone and leave
+    the prompt byte-identical), so a key that ignored ``_sim`` would pin the
+    simulated fix to the unfixed decision and quietly neuter every intervention.
+    """
+    chunks = tuple(c.text for c in (inference.retrieved_context or ()))
+    sim = tuple(sorted((str(k), repr(v)) for k, v in inference.meta.get("_sim", {}).items()))
+    return (inference.prompt, chunks, sim)
+
+
+def freeze_mock_decisions(model: ModelHandle,
+                          originals: list[_StripTarget]) -> Optional[ModelHandle]:
+    """A handle whose simulated decision is pinned to the reference-bearing run.
+
+    **Why this control is necessary, and why the half-strips cannot replace it.**
+    ``MockModel._decide`` reads ``Chunk.gold``: it derives ``gold_pos_frac`` from the
+    flag's position, and the dilution trigger requires ``0.2 <= gold_pos_frac <=
+    0.8``. Delete the flags and ``gold_pos_frac`` collapses to 0.0, the trigger stops
+    firing, and the mock *answers a dilution row correctly*. The diagnosis is then
+    scored against a different simulated model, not against the same model observed
+    with less metadata — and no real model can experience that, because no real model
+    is shown your eval metadata in the first place. The "annotations removed,
+    reference kept" half-strip does not isolate it either: with the reference intact
+    ``dil.present_wrong`` still fires and re-diagnoses the re-decided rows, so that
+    condition *masks* the artifact rather than measuring it.
+
+    This function removes the artifact directly. It replays, for each trace, the
+    decision the mock made on the reference-bearing original, so the stripped run
+    scores the *same* simulated behaviour under strictly less metadata — the
+    counterfactual the production claim is actually about.
+
+    Returns ``None`` for any backend without a ``_decide`` (i.e. every real one).
+    There is nothing to control for there: an HF or GGUF model never saw the
+    annotation, so stripping it cannot change what the model did.
+    """
+    decide = getattr(model, "_decide", None)
+    if decide is None:
+        return None
+
+    table = {}
+    for obj in originals:
+        inference = obj.inference if isinstance(obj, LabeledInference) else obj
+        table[_decision_key(inference)] = decide(inference)
+
+    def replay(inference: Inference):
+        pinned = table.get(_decision_key(inference))
+        return pinned if pinned is not None else decide(inference)
+
+    frozen = copy.copy(model)
+    # An INSTANCE attribute, deliberately: every call site inside the mock goes
+    # through ``self._decide(...)``, which finds the instance attribute before the
+    # class method, and both ``bound_to`` and ``with_tier`` are ``copy.copy`` — so
+    # the pin survives the two wrappers the pipeline puts between us and the model.
+    frozen._decide = replay
+    return frozen
 
 
 def mark_unavailable(metrics: dict) -> dict:
@@ -222,8 +318,14 @@ def _calibration_path(engine, data: list[LabeledInference], model: ModelHandle,
     (``__global__``) is being served a map fitted on reference-bearing records —
     precisely the silent pooling the ``|noref`` signature was introduced to
     prevent.
+
+    The levels are tallied **per reference-availability class**, not just in
+    aggregate. An aggregate cannot answer the question: on a mixed split the
+    level-2 hits could all belong to reference-*bearing* rows while every stripped
+    row fell through to the raw sigmoid, and the flag below would still read True.
     """
     levels: Counter = Counter()
+    noref_levels: Counter = Counter()
     signatures: Counter = Counter()
     calibrator = getattr(engine, "calibrator", None)
     for li in data:
@@ -232,24 +334,49 @@ def _calibration_path(engine, data: list[LabeledInference], model: ModelHandle,
         signatures[signature] += 1
         if calibrator is None:
             continue
+        is_noref = signature.endswith("|noref")
         z = engine.raw_logits(fv, li.inference)
         for mode in ALL_MODES:
             if z[mode] <= -49.0:          # hard-masked (non-RAG); nothing to calibrate
                 continue
             calibrator.transform(mode, signature, z[mode])
             levels[calibrator.last_fallback] += 1
+            if is_noref:
+                noref_levels[calibrator.last_fallback] += 1
 
     fitted = sorted({sig for _, sig in calibrator.maps}) if calibrator is not None else []
     named = {0: "exact_signature", 1: "coarse_ref_or_noref", 2: "global_pooled", 3: "raw_sigmoid"}
+    # `global_admits_noref` is the calibrator's own admission predicate (it replaced
+    # the older presence test `saw_noref`). Consulting it is what separates the BUG
+    # -- a reference-free trace served a pool that is reference-bearing data under
+    # another name -- from the LEGITIMATE case, where the pool really was fitted from
+    # enough reference-free records to have been shaped by them. Without it a
+    # correctly-mixed calibrator, e.g. the (b) retrained engine, is reported as
+    # buggy for doing exactly what the guard is supposed to allow.
+    admits = bool(getattr(calibrator, "global_admits_noref", False)) if calibrator else False
     return {
         "observed_signatures": dict(signatures),
         "signatures_with_a_fitted_map": fitted,
         "fallback_levels": {named[k]: v for k, v in sorted(levels.items())},
-        # The bug condition: a |noref trace served by the pooled global map, which
-        # on a reference-bearing calibration split is 100% reference-bearing data.
-        "noref_served_by_pooled_map": bool(
-            any(s.endswith("|noref") for s in signatures) and levels.get(2, 0) > 0
-        ),
+        "fallback_levels_noref_rows_only": {named[k]: v for k, v in sorted(noref_levels.items())},
+        "global_pool_admits_noref": admits,
+        "n_noref_calibration_records": int(getattr(calibrator, "n_noref", 0)) if calibrator else 0,
+        # The bug condition: a |noref trace served by the pooled global map while
+        # that pool is (near-)entirely reference-bearing.
+        #
+        # Note honestly what this can and cannot be: against the CURRENT Calibrator
+        # it is structurally unreachable, because `transform` withholds the
+        # __global__ rung under exactly the same predicate. It is a regression
+        # detector for that guard, not an observation about the run — so a False here
+        # is evidence the guard is in place, NOT evidence that pooling was measured
+        # and found absent. (Its own test therefore drives it with a stub calibrator;
+        # a flag that cannot come out True against any input is the kind of
+        # unfalsifiable metric this project keeps having to retract.)
+        "noref_served_by_pooled_map": bool(noref_levels.get(2, 0) > 0 and not admits),
+        # Reported separately because it is not a bug: the pool contains enough
+        # reference-free records that serving it to a reference-free trace is the
+        # guard working as designed.
+        "noref_served_by_admitted_pooled_map": bool(noref_levels.get(2, 0) > 0 and admits),
     }
 
 
@@ -294,12 +421,21 @@ def run_noref(
     pipeline: Optional[SignalPipeline] = None,
     seeds: tuple[int, ...] = (0, 1, 2, 3),
     tier: Tier = Tier.WHITE,
+    ingest_tier: Tier = Tier.BLACK,
 ) -> dict:
     """Measure the engine on production-shape (no-reference) traces.
 
     Same seeds and same family-dropout tier schedule as
     :func:`tokentrace.eval.ablations.run_ablations`, so the numbers sit alongside
     the published table rather than beside it.
+
+    ``tier`` is the observability tier every headline condition is scored at, and it
+    defaults to WHITE so (a)/(b) remain comparable with the published tables.
+    ``ingest_tier`` is the *second* condition: the tier a trace arriving through
+    :mod:`tokentrace.ingest` actually has. Both are scored, because varying only the
+    reference dimension and then calling the result "production" asserts the other
+    dimension is free — and §4.2(b) measures that dropping the retrieval family alone
+    costs more than half the accuracy, so freeness is not a safe assumption.
     """
     pipeline = pipeline or SignalPipeline()
     dataset = dataset if dataset is not None else build_dataset(model, pipeline, seeds=seeds)
@@ -321,13 +457,30 @@ def run_noref(
     # (b) the ceiling: everything refit on stripped data, including calibration.
     refit = train_engine(stripped_train, stripped_cal, model, pipeline, train_tiers=train_tiers)
 
-    def score(engine, data) -> tuple[dict, dict]:
-        reports = run_reports(engine, data, model, tier, pipeline)
+    def score(engine, data, handle: Optional[ModelHandle] = None,
+              at: Optional[Tier] = None) -> tuple[dict, dict]:
+        # `is None`, not `or`: Tier.BLACK == 0 is FALSY, so `at or tier` silently
+        # scored the black-box condition at the default white tier and reported it
+        # as black. Exactly the kind of quiet substitution this module exists to
+        # catch, so it is spelled out rather than left to truthiness.
+        handle = model if handle is None else handle
+        at = tier if at is None else at
+        reports = run_reports(engine, data, handle, at, pipeline)
         return compute_metrics(reports, data).as_dict(), _confusion(reports, data)
 
     baseline, baseline_cm = score(shipped, test)
     transfer, transfer_cm = score(shipped, stripped_test)
     retrained, retrained_cm = score(refit, stripped_test)
+
+    # (c) the artifact-controlled transfer: same strip as (a), but the simulated
+    # model's decision is pinned to the one it made on the reference-bearing
+    # original, so the diagnosis is scored against an UNCHANGED simulated model.
+    # See freeze_mock_decisions for why (a) alone cannot be read as production loss.
+    frozen_model = freeze_mock_decisions(model, test)
+    frozen: Optional[dict] = None
+    frozen_cm: dict[str, int] = {}
+    if frozen_model is not None:
+        frozen, frozen_cm = score(shipped, stripped_test, handle=frozen_model)
 
     # Controls that make the headline interpretable. The mock reads Chunk.gold as
     # its OWN oracle (MockModel._decide derives gold_pos_frac from the flag, and
@@ -354,6 +507,91 @@ def run_noref(
             if any(getattr(before, f) != getattr(after, f) for f in fields):
                 mock_decisions_changed[original.injection_recipe or "(unknown)"] += 1
 
+    # (d) the OTHER production axis. A trace from tokentrace.ingest carries neither a
+    # reference nor activations, so the reference-only sweep above bounds one axis
+    # and asserts the other. Scored on the same shipped engine (it was trained across
+    # the mixed-tier schedule, so black-box input is in-distribution for it) with the
+    # handle down-capped: no mechanistic capture, no logprob confidence.
+    ingest: dict[str, object] = {}
+    if ingest_tier != tier:
+        bb_baseline, bb_baseline_cm = score(shipped, test, at=ingest_tier)
+        bb_transfer, bb_transfer_cm = score(shipped, stripped_test, at=ingest_tier)
+        bb_frozen, bb_frozen_cm = (None, {})
+        if frozen_model is not None:
+            bb_frozen, bb_frozen_cm = score(shipped, stripped_test, handle=frozen_model,
+                                            at=ingest_tier)
+        ingest = {
+            "tier": ingest_tier.label,
+            "note": "The condition tokentrace.ingest actually delivers: no reference AND "
+                    "no mechanistic capture. Reported next to the same-tier baseline so "
+                    "the two losses can be separated instead of summed.",
+            "baseline": bb_baseline,
+            "transfer": mark_unavailable(bb_transfer),
+            "frozen_mock": mark_unavailable(bb_frozen) if bb_frozen is not None else None,
+            "delta_vs_same_tier_baseline": {
+                "transfer": _delta(bb_baseline, bb_transfer, _COMPARABLE),
+                "frozen_mock": _delta(bb_baseline, bb_frozen, _COMPARABLE)
+                if bb_frozen is not None else None,
+            },
+            "delta_vs_full_capture": {
+                "baseline": _delta(baseline, bb_baseline, _COMPARABLE),
+                "transfer": _delta(transfer, bb_transfer, _COMPARABLE),
+                "frozen_mock": _delta(frozen, bb_frozen, _COMPARABLE)
+                if (frozen is not None and bb_frozen is not None) else None,
+            },
+            "confusion": {"baseline": bb_baseline_cm, "transfer": bb_transfer_cm,
+                          "frozen_mock": bb_frozen_cm},
+            "calibration_path": _calibration_path(shipped, stripped_test, model, pipeline,
+                                                  ingest_tier),
+        }
+
+    # What the __global__ guard costs, regenerated rather than remembered. The guard
+    # withholds the pooled (reference-bearing) map from reference-free traces; before
+    # it existed those traces were served that map and scored differently. Forcing
+    # `n_noref` over the admission threshold reproduces the pre-guard ladder exactly,
+    # so the cost is a measurement instead of a historical note nobody can re-run.
+    calibrator = getattr(shipped, "calibrator", None)
+    guard_cost: dict[str, object] = {}
+    if calibrator is not None and not calibrator.global_admits_noref:
+        saved = calibrator.n_noref
+        try:
+            calibrator.n_noref = calibrator.min_samples
+            unguarded, unguarded_cm = score(shipped, stripped_test)
+            unguarded_ece = {
+                "uncalibrated": _ece_full(shipped, stripped_test, model, pipeline, tier,
+                                          calibrated=False),
+                "calibrated": _ece_full(shipped, stripped_test, model, pipeline, tier,
+                                        calibrated=True),
+            }
+            # How many production-shape probabilities the pooled reference-bearing map
+            # actually served before the guard. Regenerated here rather than quoted
+            # from memory: with the guard live the guarded path reports 0, so the
+            # published count has no other way to stay checkable.
+            unguarded_path = _calibration_path(shipped, stripped_test, model, pipeline, tier)
+        finally:
+            calibrator.n_noref = saved
+        guard_cost = {
+            "note": "Transfer condition with the __global__ rung force-admitted, i.e. the "
+                    "behaviour before the guard. The guard is right — the pooled map was "
+                    "validated on reference-BEARING held-out data and never on "
+                    "reference-free traces — but it is not free, and a partial disclosure "
+                    "of its cost is its own kind of burying.",
+            "before_guard": mark_unavailable(unguarded),
+            "after_guard": mark_unavailable(transfer),
+            "delta_after_minus_before": _delta(unguarded, transfer, _COMPARABLE),
+            "before_guard_ece": unguarded_ece,
+            "before_guard_confusion": unguarded_cm,
+            "before_guard_per_mode": unguarded["per_mode"],
+            "before_guard_calibration_path": unguarded_path,
+            # How many of the metrics this module calls comparable actually moved.
+            # Counted rather than asserted: "it moves at least eight metrics" was a
+            # prose claim with nothing behind it.
+            "n_comparable_metrics_moved": sum(
+                1 for v in _delta(unguarded, transfer, _COMPARABLE).values() if v != 0),
+            "comparable_metrics_moved": sorted(
+                k for k, v in _delta(unguarded, transfer, _COMPARABLE).items() if v != 0),
+        }
+
     ret, dil = FailureMode.RETRIEVAL_FAILURE.value, FailureMode.CONTEXT_DILUTION.value
     retrieval_to_dilution = _flow_from(transfer_cm, ret).get(dil, 0)
     dilution_to_retrieval = _flow_from(transfer_cm, dil).get(ret, 0)
@@ -369,6 +607,22 @@ def run_noref(
         "transfer": mark_unavailable(transfer),
         # (b) the ceiling: refit end-to-end on stripped data.
         "retrained": mark_unavailable(retrained),
+        # (c) THE HONEST HEADLINE: (a) with the mock's decision pinned to the
+        # reference-bearing run, so nothing but the available metadata changed.
+        # ``None`` on a real backend, where the artifact cannot arise.
+        "frozen_mock": {
+            "note": "Both reference and gold flags stripped, but MockModel._decide is "
+                    "replayed from the reference-bearing original. Quote THIS, not "
+                    "`transfer`, as the production estimate: the gap between them is "
+                    "the simulator losing an oracle no real model ever had.",
+            "metrics": mark_unavailable(frozen) if frozen is not None else None,
+            "confusion": frozen_cm,
+            "delta_vs_baseline": _delta(baseline, frozen, _COMPARABLE)
+            if frozen is not None else None,
+            "delta_vs_transfer": _delta(transfer, frozen, _COMPARABLE)
+            if frozen is not None else None,
+            "available": frozen is not None,
+        },
         "delta_vs_baseline": {
             "transfer": _delta(baseline, transfer, _COMPARABLE),
             "retrained": _delta(baseline, retrained, _COMPARABLE),
@@ -418,14 +672,27 @@ def run_noref(
                                                     calibrated=False),
                           "calibrated": _ece_full(refit, stripped_test, model, pipeline, tier,
                                                   calibrated=True)},
+            "frozen_mock": {"uncalibrated": _ece_full(shipped, stripped_test, frozen_model,
+                                                      pipeline, tier, calibrated=False),
+                            "calibrated": _ece_full(shipped, stripped_test, frozen_model,
+                                                    pipeline, tier, calibrated=True)}
+            if frozen_model is not None else None,
         },
         "confound_controls": {
             "note": "Not shippable configurations. They decompose the headline drop into "
                     "(i) losing the reference, (ii) losing the gold-chunk annotation, and "
                     "(iii) the mock re-deciding because MockModel._decide reads Chunk.gold "
-                    "as its own oracle — an artifact with no production analogue.",
+                    "as its own oracle — an artifact with no production analogue. (iii) is "
+                    "SCORED in the top-level `frozen_mock` block; these two half-strips only "
+                    "bound it, and the 'annotations removed, reference kept' row cannot "
+                    "isolate it at all (the reference keeps dil.present_wrong firing, which "
+                    "masks the re-decided rows rather than exposing them).",
             "reference_only_removed": reference_only,
             "annotations_only_removed": annotations_only,
             "mock_decisions_changed_by_recipe": dict(mock_decisions_changed),
         },
+        # (d) the second production axis, measured rather than assumed.
+        "ingest_shape": ingest,
+        # What refusing the pooled map costs, on every comparable metric.
+        "guard_cost": guard_cost,
     }
