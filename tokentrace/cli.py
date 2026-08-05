@@ -77,7 +77,11 @@ def _parse_seeds(raw: str) -> tuple[int, ...]:
 def _open_text(path: str):
     """`open()` that reports why it could not, and keeps the file streamable."""
     try:
-        return open(path, encoding="utf-8")
+        # utf-8-sig, matching ingest.load_traces: a BOM is common in files written by
+        # Windows tooling, and with plain utf-8 the first read returns ﻿ instead
+        # of "[", which misroutes a BOM'd JSON *array* into the JSONL branch and then
+        # fails on a line that is actually valid.
+        return open(path, encoding="utf-8-sig")
     except OSError as exc:
         _fail(f"cannot read {path}: {exc.strerror or exc}")
 
@@ -287,7 +291,11 @@ def _stream_traces(path: str, load, source: str) -> Iterator[Inference]:
                 payload = json.loads(line)
             except json.JSONDecodeError as exc:
                 _fail(f"{path}:{n}: not valid JSON ({exc.msg})")
-            yield _load_trace(load, payload, source, f"{path}:{n}", f"{name}#{n - 1}")
+            # 1-based, matching BOTH the error locator on this line and the id
+            # ingest.load_traces assigns. It was 0-based, so a reported `file:5`
+            # could not be matched to the trace it named, and the CLI and the
+            # library disagreed about the identity of the same row.
+            yield _load_trace(load, payload, source, f"{path}:{n}", f"{name}#{n}")
 
 
 # --------------------------------------------------------------------------- #

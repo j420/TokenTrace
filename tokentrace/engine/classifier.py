@@ -61,11 +61,17 @@ class ResidualClassifier:
                 # over a few hundred rows, so there is no parallelism worth having,
                 # but LightGBM's default (n_jobs=-1) spawns one OpenMP thread per
                 # core and they SPIN-WAIT. On a busy machine those spinners contend
-                # with each other and with every other process: measured `eval
-                # --seeds 0` at 10 minutes here, versus 4 seconds once the spinning
-                # stopped — a 100x cliff that looks like the engine being slow and
-                # is really the thread pool fighting itself. A CPU-first tool must
-                # not degrade like that on the laptop it targets.
+                # with each other and with every other process, so the cost is not a
+                # fixed multiplier — it grows with how loaded the box is, which is
+                # what makes it so misleading: it reads as the engine being slow when
+                # it is really the thread pool fighting itself.
+                #
+                # Measured on this machine: `tokentrace eval --seeds 0` took ~10
+                # minutes under heavy concurrent load with the default, and 4.4s
+                # single-threaded afterwards. Those two runs are NOT a controlled
+                # comparison (the load differed), so treat them as evidence that the
+                # cliff exists, not as a calibrated speedup figure. A CPU-first tool
+                # must not degrade this way on the laptop it targets.
                 n_jobs=1,
             )
             model.fit(X, y, init_score=init, sample_weight=sample_weight)

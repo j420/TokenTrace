@@ -62,10 +62,27 @@ def _fin(x: Any) -> Any:
     ``json.dumps`` emits bare ``NaN``/``Infinity`` tokens, which are NOT valid
     RFC 8259 JSON: they break ``tokentrace analyze --json`` for any strict consumer
     and make every cached trace file unparseable by non-Python readers.
+
+    Every float this module emits must pass through here. That is a whole-document
+    property — one unscrubbed field poisons the entire blob — so a guard test built
+    from a *healthy* report can never observe a gap in the sweep; it has to inject a
+    non-finite value into each field in turn.
     """
     if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
         return None
     return x
+
+
+def _num(value: Any, default: float) -> float:
+    """Inverse of :func:`_fin` on the way back in.
+
+    ``.get(key, default)`` does NOT cover an explicit ``null``, and every
+    ``_fin``-scrubbed field writes one. Without this a round trip returns ``None``
+    where the dataclass declares ``float``, which then fails on the first
+    comparison or arithmetic a consumer performs (ranking, thresholding, a cache
+    key). Same defect that ``chunk_from_dict`` was fixed for.
+    """
+    return default if value is None else value
 
 
 def evidence_to_dict(e: EvidenceItem) -> dict[str, Any]:
@@ -93,14 +110,20 @@ def recommendation_to_dict(r: Recommendation) -> dict[str, Any]:
 
 
 def diagnosis_to_dict(d: Diagnosis) -> dict[str, Any]:
+    # `probability` and `confidence` were the two floats the _fin sweep missed, and
+    # they are the ones most likely to go non-finite: they come out of the calibrator
+    # and the log-odds sum, where an empty/degenerate calibration bin or an inf
+    # contribution propagates straight through. A single NaN here makes the WHOLE
+    # `analyze --json` document non-RFC-8259 and every cached report file unreadable
+    # by a non-Python parser.
     return {
         "mode": d.mode.value,
-        "probability": d.probability,
+        "probability": _fin(d.probability),
         "rank": d.rank,
         "role": d.role.value if d.role else None,
         "causal_parents": [m.value for m in d.causal_parents],
         "evidence": [evidence_to_dict(e) for e in d.evidence],
-        "confidence": d.confidence,
+        "confidence": _fin(d.confidence),
         "recommendations": [recommendation_to_dict(r) for r in d.recommendations],
     }
 
@@ -111,7 +134,7 @@ def report_to_dict(rep: DiagnosisReport) -> dict[str, Any]:
         "tier": rep.tier.label,
         "diagnoses": [diagnosis_to_dict(d) for d in rep.diagnoses],
         "conformal_set": [m.value for m in rep.conformal_set],
-        "diagnostic_confidence": rep.diagnostic_confidence,
+        "diagnostic_confidence": _fin(rep.diagnostic_confidence),
         "abstained": rep.abstained,
         "notes": rep.notes,
     }
@@ -122,11 +145,11 @@ def labeled_to_dict(li: LabeledInference) -> dict[str, Any]:
         "inference": inference_to_dict(li.inference),
         "labels": [m.value for m in li.labels],
         "causal_edges": [[a.value, b.value] for a, b in li.causal_edges],
-        "severity": {m.value: v for m, v in li.severity.items()},
+        "severity": {m.value: _fin(v) for m, v in li.severity.items()},
         "provenance": li.provenance.value,
         "injection_recipe": li.injection_recipe,
         "verification": li.verification,
-        "weight": li.weight,
+        "weight": _fin(li.weight),
     }
 
 
@@ -189,12 +212,12 @@ def recommendation_from_dict(d: dict[str, Any]) -> Recommendation:
 def diagnosis_from_dict(d: dict[str, Any]) -> Diagnosis:
     return Diagnosis(
         mode=FailureMode(d["mode"]),
-        probability=d["probability"],
+        probability=_num(d["probability"], 0.0),
         rank=d.get("rank", 0),
         role=DiagnosisRole(d["role"]) if d.get("role") else None,
         causal_parents=[FailureMode(m) for m in d.get("causal_parents", [])],
         evidence=[evidence_from_dict(e) for e in d.get("evidence", [])],
-        confidence=d.get("confidence", 0.0),
+        confidence=_num(d.get("confidence", 0.0), 0.0),
         recommendations=[recommendation_from_dict(r) for r in d.get("recommendations", [])],
     )
 
@@ -206,7 +229,7 @@ def report_from_dict(d: dict[str, Any]) -> DiagnosisReport:
         tier=tier_map.get(d.get("tier", "black"), Tier.BLACK),
         inference_id=d.get("inference_id"),
         conformal_set=[FailureMode(m) for m in d.get("conformal_set", [])],
-        diagnostic_confidence=d.get("diagnostic_confidence", 0.0),
+        diagnostic_confidence=_num(d.get("diagnostic_confidence", 0.0), 0.0),
         abstained=d.get("abstained", False),
         notes=d.get("notes", []),
     )
@@ -217,9 +240,9 @@ def labeled_from_dict(d: dict[str, Any]) -> LabeledInference:
         inference=inference_from_dict(d["inference"]),
         labels=[FailureMode(m) for m in d.get("labels", [])],
         causal_edges=[(FailureMode(a), FailureMode(b)) for a, b in d.get("causal_edges", [])],
-        severity={FailureMode(m): v for m, v in d.get("severity", {}).items()},
+        severity={FailureMode(m): _num(v, 0.0) for m, v in d.get("severity", {}).items()},
         provenance=Provenance(d.get("provenance", "synthetic")),
         injection_recipe=d.get("injection_recipe"),
         verification=d.get("verification", {}),
-        weight=d.get("weight", 1.0),
+        weight=_num(d.get("weight", 1.0), 1.0),
     )

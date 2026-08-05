@@ -175,6 +175,38 @@ def main() -> None:
                      hide_index=True, **_fit(st.dataframe))
 
 
+def _fix_outcome(rec_er, inf, new_answer: str) -> tuple[str, str]:
+    """Classify a just-run intervention as ``(severity, message)``.
+
+    FOUR outcomes, not two — and the split is deliberately
+    :meth:`Recommender._maybe_validate`'s, not a second opinion formed here. The badge
+    rendered one line above comes from ``rec.validated``, which the recommender leaves
+    ``None`` whenever it declined to score the fix, so any verdict computed on a
+    different rule can contradict the badge on the same screen.
+
+    It did, on the case the recommender is most careful about. Judging the fix by
+    ``_correct(new_answer, ...)`` alone ignores whether the answer was ALREADY correct
+    — the right-answer-for-wrong-reasons trace (fragile parametric recall, catalogued
+    in ``docs/ARCHITECTURE.md``). There the intervention changes nothing, the
+    recommender records "advisory, unscored" and the badge reads "ℹ️ advisory", while
+    the verdict underneath it rendered "✅ now correct" in success green: a repair that
+    never happened, reported as a win.
+    """
+    seen = f"After fix, answer → `{new_answer}`"
+    if rec_er is None or not inf.has_ground_truth:
+        # Production traces: nothing to check the new answer against, so the outcome
+        # is unknown. Rendering unknown in success green (as this once did) overstates
+        # the result on exactly the traces a real user brings.
+        return "info", f"{seen} · ❔ outcome unknown (no ground truth to check against)"
+    if rec_er._correct(inf.generated_answer, inf.ground_truth):
+        return "info", (f"{seen} · ℹ️ advisory, not scored — the original answer was "
+                        "already correct, so this fix repaired nothing (it targets how "
+                        "the answer was reached, not whether it was right)")
+    if rec_er._correct(new_answer, inf.ground_truth):
+        return "success", f"{seen} · ✅ now correct"
+    return "warning", f"{seen} · ❌ still wrong"
+
+
 def _render_recommendation(tt: TokenTrace, inf, rec) -> None:
     badge = {True: "✅ validated", False: "❌ no effect", None: "ℹ️ advisory"}[rec.validated]
     st.markdown(f"**Fix ({rec.targets_mode.pretty}):** {rec.description}  \n_{badge}_")
@@ -185,17 +217,13 @@ def _render_recommendation(tt: TokenTrace, inf, rec) -> None:
             st.write("No structural fix available — recommend the model abstain.")
             return
         new_answer = tt.model.bound_to(modified).generate(modified.prompt).text
-        # Three outcomes, not two. Without ground truth we cannot say whether the fix
-        # worked, and rendering "unknown" in success green (as this did) overstates the
-        # result on exactly the traces a production user brings — where there is no
-        # reference to check against.
-        rec_er = tt.engine.recommender
-        if rec_er is None or not inf.has_ground_truth:
-            st.info(f"After fix, answer → `{new_answer}` · outcome unknown (no ground truth)")
-        elif rec_er._correct(new_answer, inf.ground_truth):
-            st.success(f"After fix, answer → `{new_answer}` · ✅ now correct")
+        severity, message = _fix_outcome(tt.engine.recommender, inf, new_answer)
+        if severity == "success":
+            st.success(message)
+        elif severity == "warning":
+            st.warning(message)
         else:
-            st.warning(f"After fix, answer → `{new_answer}` · ❌ still wrong")
+            st.info(message)
 
 
 if __name__ == "__main__":
