@@ -28,23 +28,34 @@ dependencies = [
 # Real model generation (quantized, CPU). llama.cpp Q4 ~2.5GB RAM/model.
 generate = ["llama-cpp-python>=0.2.70", "huggingface-hub>=0.23"]
 # Grey/white-box mechanistic capture (single HF forward pass on CPU; patching on
-# small models). torch+transformers only; nnsight/transformer-lens are optional.
+# small models). nnsight is declared because tokentrace/models/nnsight.py imports it;
+# transformer-lens is NOT declared and NOT imported anywhere -- see the capture
+# fallback ladder in docs/ARCHITECTURE.md for what actually exists.
 mechanistic = ["torch>=2.2", "transformers>=4.44", "nnsight>=0.3"]
 # Retrieval + NLI + embeddings (all small, CPU).
 retrieval = ["faiss-cpu>=1.8", "sentence-transformers>=3.0"]
-# Prompt-signal helpers.
-prompt = ["spacy>=3.7"]
+# NOTE: there is deliberately no `prompt` extra. It declared spacy>=3.7, which no
+# code path imports -- the same dead-dependency defect already removed for plotly
+# and pandas. The prompt-signal extractors are pure-python heuristics; if a real
+# parser is wired in later, add the extra alongside the import, not before it.
 # Interactive developer tool. Streamlit only: the app renders through st.bar_chart
 # and st.dataframe (which take plain dicts/lists), so the previously declared plotly
-# and pandas were never imported by any code path. Layout kwargs are feature-detected
-# at call time rather than pinned, so no narrow version floor is needed here.
+# and pandas were never imported by any code path.
+#
+# On the floor: an earlier comment here claimed feature detection made a floor
+# unnecessary. That was false and cost the app its whole range below 1.49 — the shim
+# detected the NAME `width` but not its SEMANTICS, and `width` was `int | None`
+# (pixels) until 1.49, so a string went into an int protobuf field and the app
+# crashed at the first table. The shim now checks the parameter's default type, which
+# is correct for both eras. Verified working on 1.61.0; verified to select the OLD
+# spelling on 1.36.0. The app has NOT been run end-to-end on anything between.
 app = ["streamlit>=1.36"]
 # Dataset loaders (RAGTruth, HotpotQA, NQ, TruthfulQA, BEIR).
 data = ["datasets>=2.20"]
 dev = ["pytest>=8.0", "ruff>=0.5", "mypy>=1.10"]
 # Everything.
 all = [
-    "tokentrace[generate,mechanistic,retrieval,prompt,app,data,dev]",
+    "tokentrace[generate,mechanistic,retrieval,app,data,dev]",
 ]
 
 [project.scripts]

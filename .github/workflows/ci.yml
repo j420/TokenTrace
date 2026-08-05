@@ -19,11 +19,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install (CPU core + dev only — no GPU, no model downloads)
+      # `app` is included so the Streamlit tests actually RUN. They importorskip,
+      # so installing only [dev] silently skipped all of them -- the demo is one of
+      # the project's three deliverables and was effectively untested in CI.
+      # Still no GPU and no model downloads: streamlit is a pure-python UI dep.
+      - name: Install (CPU core + dev + app — no GPU, no model downloads)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,app]"
       - name: Lint
-        run: ruff check tokentrace tests
+        run: ruff check tokentrace tests scripts
       - name: Test
         run: pytest -q
+      - name: Assert the Streamlit tests were not skipped
+        run: |
+          pytest tests/test_app.py -q -rs 2>&1 | tee /tmp/app.log
+          grep -q "skipped" /tmp/app.log && { echo "app tests skipped in CI"; exit 1; } || true
