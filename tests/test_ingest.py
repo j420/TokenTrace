@@ -407,7 +407,15 @@ def test_ingested_trace_analyzes_at_every_tier(tt, fixture, tier):
     assert report.inference_id == inf.id
     assert len(report.diagnoses) == 5                       # every mode is ranked
     assert all(0.0 <= d.probability <= 1.0 for d in report.diagnoses)
-    assert report.primary is not None
+    # `report.primary` falls back to `diagnoses[0]`, so the old `is not None` here
+    # could not fail once the line above asserted five diagnoses. Assert the ranking
+    # contract instead, which can: every mode ranked exactly once, ranks dense and
+    # ordered, probabilities non-increasing.
+    assert {d.mode for d in report.diagnoses} == set(FailureMode)
+    assert [d.rank for d in report.diagnoses] == [0, 1, 2, 3, 4]
+    ordered = [d.probability for d in report.diagnoses]
+    assert ordered == sorted(ordered, reverse=True)
+    assert report.primary in report.diagnoses
     # Ingest must not have silently invented an answer.
     assert inf.generated_answer.strip() != ""
 
@@ -674,7 +682,7 @@ def test_load_traces_json_array(tmp_path):
     traces = list(load_traces(path))
     assert [t.meta["source"] for t in traces] == ["langchain", "llamaindex"]
     assert traces[0].id == "lc-run-7f2a"                 # id from the payload wins
-    assert traces[1].id == "traces.json#1"               # positional fallback
+    assert traces[1].id == "traces.json#1"               # 0-based ARRAY index
     assert traces[1].question == "What is the escalation path for a delayed shipment?"
 
 
@@ -683,7 +691,10 @@ def test_load_traces_jsonl(tmp_path):
     path.write_text("\n".join(json.dumps(p) for p in _two_payloads()) + "\n\n")
     traces = list(load_traces(path))
     assert [t.meta["source"] for t in traces] == ["langchain", "llamaindex"]
-    assert traces[1].id == "traces.jsonl#1"
+    # 1-based LINE number, matching what this format's error messages report — the
+    # id used to be 0-based while errors were 1-based, so the two could not be
+    # cross-referenced (see test_ingest_review_fixes for the paired assertion).
+    assert traces[1].id == "traces.jsonl#2"
     assert [len(t.retrieved_context) for t in traces] == [3, 3]
 
 
