@@ -2,6 +2,7 @@
 
     tokentrace demo                 # run the five canonical failure scenarios
     tokentrace analyze trace.json   # diagnose one inference (JSON)
+    tokentrace triage traces.jsonl  # diagnose a whole log, ranked by cluster
     tokentrace inject --out d.jsonl # build the synthetic labeled corpus
     tokentrace eval                 # train + evaluate against the targets
 """
@@ -155,6 +156,38 @@ def cmd_ablate(args) -> int:
     return 0
 
 
+def cmd_triage(args) -> int:
+    from tokentrace import TokenTrace
+    from tokentrace.triage import render_text, triage
+
+    def _stream():
+        """Yield traces lazily so a large log never has to fit in memory."""
+        with open(args.traces) as f:
+            head = f.read(1)
+            f.seek(0)
+            if head == "[":                       # a single JSON array
+                for d in json.load(f):
+                    yield inference_from_dict(d)
+                return
+            for n, line in enumerate(f, 1):       # JSONL, one trace per line
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield inference_from_dict(json.loads(line))
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise SystemExit(f"{args.traces}:{n}: not a valid trace — {exc}") from exc
+
+    tt = TokenTrace.default(backend=args.backend, model_name=args.model,
+                            tier=_TIER[args.tier], train=not args.fast)
+    report = triage(_stream(), tt, tier=_TIER[args.tier])
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(render_text(report, top=args.top))
+    return 0
+
+
 def cmd_eval(args) -> int:
     from tokentrace.data.synthetic import build_dataset
     from tokentrace.eval.benchmark import train_and_evaluate
@@ -206,6 +239,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     e.add_argument("--seeds", default="0,1,2,3")
     e.add_argument("--json", action="store_true")
     e.set_defaults(func=cmd_eval)
+
+    tr = sub.add_parser("triage", parents=[common],
+                        help="diagnose a whole log of traces and rank the clusters to fix")
+    tr.add_argument("traces", help="JSONL (one inference per line) or a JSON array")
+    tr.add_argument("--fast", action="store_true", help="cold-start (rules only), skip training")
+    tr.add_argument("--top", type=int, default=10, help="clusters to show (default 10)")
+    tr.add_argument("--json", action="store_true")
+    tr.set_defaults(func=cmd_triage)
 
     ab = sub.add_parser("ablate", parents=[common], help="run ablation studies (learned head, per-family, calibration)")
     ab.add_argument("--seeds", default="0,1,2,3")
