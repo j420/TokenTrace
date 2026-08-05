@@ -17,6 +17,10 @@ cases are expressed as "which signal families are present", not as bespoke
 branches. `FeatureVector.missingness_signature()` selects the matching
 calibration map.
 
+One trace at a time is the *diagnostic* unit, not the *operational* one. A developer
+has a log of thousands, so `triage/` runs the same pipeline over a fleet and
+aggregates (see [Fleet triage](#fleet-triage-triage)).
+
 ## Core contracts (`core/types.py`)
 
 `Inference` (prompt, `retrieved_context: list[Chunk] | None`, `generated_answer`,
@@ -95,6 +99,36 @@ No public dataset ships `(inference → failure-mode)` labels, so:
 
 Missing families are handled by: GBT NaN routing · per-signature calibration ·
 rules abstaining · wider conformal sets → lower confidence → abstention/escalation.
+
+## Fleet triage (`triage/`)
+
+`triage(traces, tt)` streams N inferences through the engine and aggregates them
+into a ranked fix list — the observability question ("which cluster do I fix
+first?") rather than the diagnostic one ("why did *this* fail?").
+
+- **Cluster key = (primary failure mode, headline evidence signal)**, not mode
+  alone. A retrieval failure driven by `gold_recall_in_context` needs a different
+  fix from one driven by `max_chunk_relevance`; collapsing them hides that. Note
+  the key vocabulary differs by engine state: cold-start clusters key on rule ids
+  (`ret.gold_absent`), a trained engine on TreeSHAP feature names.
+- **Ranked by `n × mean_diagnostic_confidence`** — labelled everywhere as a triage
+  ORDER, not measured impact. Deliberately *not* ranked by validated impact, which
+  would sink every production cluster (no ground truth) to the bottom.
+- **Three buckets, never merged:** diagnosed / healthy / declined. An all-abstained
+  run cannot be misread as a clean fleet, and `mode_distribution()` returns `{}`
+  rather than five zero shares when nothing was diagnosed.
+- **Honesty contract.** Every field is classified MEASURED, UNKNOWN or DESCRIPTIVE
+  in the module docstring. Fix impact comes only from recommendations the simulated
+  intervention actually scored, and is `None` — never `0` — without ground truth,
+  because `0` would assert the fix was tried and did nothing. There is deliberately
+  no diagnosis-accuracy number here: triage runs on unlabeled traces.
+- Streaming (O(clusters) memory), tolerant of a trace that raises, and importing it
+  pulls in no numpy/lightgbm/sklearn.
+
+## CLI surface
+
+`demo` · `analyze <trace.json>` · **`triage <traces.jsonl>`** · `inject` · `eval` ·
+`ablate`. The first three are user-facing; the last three are the research harness.
 
 ## Edge cases
 
