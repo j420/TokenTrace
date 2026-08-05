@@ -30,6 +30,9 @@ Mapping notes
   for nodes that came from a keyword or summary index). An unscored node keeps the
   default ``retriever_score`` and is reported through the ``partial``/``absent``
   provenance rather than being written down as 0.0.
+* Only similarity-shaped keys are read as a score (:data:`_SCORE_KEYS`). A
+  *distance* is inverted relative to a similarity and would rank the retrieval
+  backwards; it stays unmeasured.
 * ``node.metadata`` is *not* mined for a gold flag beyond the explicit gold keys —
   LlamaIndex metadata is user-defined and routinely contains ``relevance``,
   ``label``, ``score`` keys that mean something else entirely.
@@ -68,6 +71,17 @@ _TEXT_PATHS = ("text", "text_resource.text", "content", "get_content", "node_con
 _NODE_ID_PATHS = ("id_", "node_id", "id", "doc_id", "ref_doc_id")
 _META_SOURCE_KEYS = ("file_name", "source", "file_path", "doc_id", "document_id", "url", "title")
 
+#: Similarity-shaped keys only, and the same correctness invariant ``langchain``
+#: states for ``langchain._SCORE_KEYS``: a *distance* (``distance``,
+#: ``_distance``, ``distance_to_query``) is monotonically INVERTED relative to a
+#: similarity, so copying one into ``retriever_score`` records the most relevant
+#: node as the least relevant one. Vector stores that LlamaIndex wraps (Chroma,
+#: FAISS with an L2 index) return exactly that key, so the temptation to add it
+#: here is real — it was named only in a sibling module's comment, with nothing
+#: enforcing it on this side. An unrecognized key leaves the score *unmeasured*,
+#: which the ``absent``/``partial`` provenance reports honestly.
+_SCORE_KEYS = ("score", "similarity")
+
 
 def _looks_like_node(value: Any) -> bool:
     if not isinstance(value, Mapping):
@@ -94,9 +108,9 @@ def _build_chunks(nodes: Any) -> ChunkBuilder:
         text = first_text(node, _TEXT_PATHS)
         # The score sits on the NodeWithScore wrapper; fall back to the node itself
         # for integrations that flattened the pair.
-        score = first_present(item, ("score", "similarity"))
+        score = first_present(item, _SCORE_KEYS)
         if score is None:
-            score = first_present(node, ("score", "similarity"))
+            score = first_present(node, _SCORE_KEYS)
 
         node_id = first_present(node, _NODE_ID_PATHS)
         source_id = first_present(metadata, tuple(f"['{k}']" for k in _META_SOURCE_KEYS))
