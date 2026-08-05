@@ -29,7 +29,11 @@ from tokentrace.core.types import (
 def chunk_to_dict(c: Chunk) -> dict[str, Any]:
     return {
         "text": c.text,
-        "retriever_score": c.retriever_score,
+        # Scrubbed like every other float we emit: a retriever that returns NaN
+        # (a cosine over a zero vector will) otherwise wrote a bare NaN token into
+        # cached traces and `analyze --json`, which _fin exists to prevent. This
+        # was the one float serializer that skipped it.
+        "retriever_score": _fin(c.retriever_score),
         "source_id": c.source_id,
         "gold": c.gold,
         "char_span": list(c.char_span) if c.char_span else None,
