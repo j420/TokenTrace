@@ -213,16 +213,23 @@ def run_robustness(
     noise_levels: tuple[float, ...] = (0.0, 0.2, 0.35),
     seeds: tuple[int, ...] = (0, 1, 2, 3),
     pipeline: Optional[SignalPipeline] = None,
+    model: Optional[ModelHandle] = None,
 ) -> dict:
     """Sweep signal-observation noise to show the metrics stop saturating and that
     calibration earns its keep. Labels come from the CLEAN pipeline (trustworthy);
     train + eval use the NOISY pipeline, mirroring real data where the estimators
     themselves are imperfect.
+
+    ``model`` defaults to the deterministic mock handle, which is what every caller
+    got before it was a parameter. It exists because the handle was hard-coded:
+    ``tokentrace ablate --backend hf --model qwen3-4b`` ran :func:`run_ablations` on
+    the real handle and this sweep on the mock, then printed both under one report
+    with nothing distinguishing them.
     """
     from tokentrace.models.registry import load_model
 
     pipeline = pipeline or SignalPipeline()
-    model = load_model("mock-4b", backend="mock")
+    model = model if model is not None else load_model("mock-4b", backend="mock")
     dataset = build_dataset(model, pipeline, seeds=seeds)   # clean labels
     train, cal, test = split_dataset(dataset)
 
