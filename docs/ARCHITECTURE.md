@@ -59,7 +59,14 @@ context-dilution** discriminator.
   production trace would silently reuse a map fitted on reference-bearing data).
   Self-validating: a map is adopted only if it beats the raw sigmoid on held-out
   Brier score. Isotonic on large buckets, Platt on thin ones. Hierarchical
-  fallback: exact signature -> ref/noref -> global -> raw sigmoid.
+  fallback: exact signature -> ref/noref -> global -> raw sigmoid, where the
+  `global` rung is **withheld from a reference-free trace** unless the pool was
+  fitted from at least `min_samples` reference-free records
+  (`Calibrator.global_admits_noref`) — otherwise `__global__` is the
+  reference-bearing map under another name and serving it defeats the `|noref`
+  guard one rung above. A trace that clears no rung gets the raw sigmoid, which is
+  the honest outcome and is what production-shape traces actually get today (see
+  REPORT §4.5).
 - **Conformal (`conformal.py`)** — APS sets over NORMALIZED marginals (the engine
   emits independent one-vs-rest probabilities that do not sum to 1; accumulating
   them raw made tau fit to 1.0 and inverted the set-size signal). Masked modes are
@@ -83,9 +90,19 @@ No public dataset ships `(inference → failure-mode)` labels, so:
    a **verification gate** confirms the intended effect (else discarded). Yields
    multi-label + causal-edge supervision.
 3. **Provenance tiers** — `REAL` (RAGTruth + human seed) → headline eval only;
-   `SEMI` + `SYNTHETIC` → train. Family-dropout at train time (per-row tier
-   schedule) hardens the heads against missing families and keeps per-tier
-   calibration honest.
+   `SEMI` + `SYNTHETIC` → train.
+
+**Family-dropout, and where it actually applies.** Training across a per-row tier
+schedule (`[WHITE, GREY, BLACK]` cycled over the training rows) hardens the heads
+against missing families and keeps per-tier calibration honest — but it is a
+property of the *research harness*, not of training in general. It is passed by
+`train_and_evaluate(family_dropout=True)`, `eval/ablations.py` and
+`eval/noref.py`; `train_engine` itself defaults `train_tiers=None`, and
+**`TokenTrace.default()` — the user-facing path, used by the CLI, the API examples
+and the Streamlit app — does not pass it**. The engine a user gets is therefore
+trained at the handle's own tier only. This document previously stated the
+dropout as unconditional; it is not, and the benchmark tables (which do use it)
+are not evidence about the default engine.
 
 ## Compute-adaptive tiers
 
@@ -99,6 +116,26 @@ No public dataset ships `(inference → failure-mode)` labels, so:
 
 Missing families are handled by: GBT NaN routing · per-signature calibration ·
 rules abstaining · wider conformal sets → lower confidence → abstention/escalation.
+
+### Backends: what selection actually does
+
+`load_model(name, backend=...)` instantiates **one** of four `ModelHandle`
+implementations — `mock`, `gguf` (llama.cpp), `hf` (`transformers` forward hooks),
+`nnsight` — chosen by the caller's `backend` argument. There is **no runtime
+fallback between backends**: an unavailable backend raises on import rather than
+silently degrading to another, and `available_backends()` only *reports*
+importability, nothing consumes it to pick one. Earlier revisions of this document
+and of the README advertised a ladder
+"HookedTransformer → TransformerBridge → NNsight → raw HF hooks"; TransformerLens
+is not imported anywhere, is not declared in any extra, and neither of the first
+two rungs exists in code.
+
+What *is* automatic is degradation along the **tier** axis, and only downwards:
+`load_model` clamps the requested tier to `ModelProfile.max_tier`,
+`ModelHandle.with_tier` can only down-cap, methods above the handle's tier raise
+`TierUnavailable`, and `MechanisticExtractor` catches that and emits nothing — so
+the features land in the missingness mask and every mechanism above keys off them.
+That is the whole auto-degrade story.
 
 ## Fleet triage (`triage/`)
 
@@ -142,7 +179,7 @@ first?") rather than the diagnostic one ("why did *this* fail?").
 | reasoning vs knowledge-gap | multihop + gold present + wrong + late/unstable formation |
 | retrieval-failure vs dilution | `gold_recall_in_context` (absent vs present) |
 | tokenizer / architecture differences | model-relative features (depth as fraction of layers; normalized attention) via `ModelProfile` |
-| TransformerLens unsupported | fallback ladder → auto-degrade to grey-box (`ModelProfile.max_tier`) |
+| a backend cannot reach white-box capture | `ModelProfile.max_tier` caps the handle; `MechanisticExtractor` catches `TierUnavailable` and the features go MISSING, not zero |
 | confident-but-wrong vs unconfident-but-right | confidence family orthogonal to correctness → the 2×2 is a feature |
 
 ## Evaluation (`eval/`)
