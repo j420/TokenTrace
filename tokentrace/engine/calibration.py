@@ -97,15 +97,37 @@ class Calibrator:
         #: 0 exact per-signature map, 1 coarse ref/noref, 2 global, 3 raw sigmoid.
         #: Surfaced so a caller can tell the user a probability came from a pooled map.
         self.last_fallback: int = 0
-        #: Did the fitting data contain ANY reference-free record? If not, the
-        #: ``__global__`` pool is 100% reference-bearing, so serving it to a
-        #: reference-free trace is the very pooling this class exists to prevent —
-        #: see :meth:`transform`.
-        self.saw_noref: bool = False
+        #: How many reference-free records the ``__global__`` pool was fitted from.
+        #: See :attr:`global_admits_noref` — a *presence* test is not enough.
+        self.n_noref: int = 0
+
+    @property
+    def global_admits_noref(self) -> bool:
+        """May a reference-free trace be served the pooled ``__global__`` map?
+
+        Only when that pool contains ENOUGH reference-free records to have shaped
+        it. An earlier version asked merely whether it had seen *any*, which a
+        single stray record satisfied — 400 reference-bearing records plus one
+        reference-free one produced a 99.75%-reference-bearing ``__global__`` that
+        the guard then happily served, restoring the exact bug it was written to
+        stop. That is reachable in the real workflow: one row with
+        ``ground_truth=None`` in the calibration split (``load_ragtruth`` produces
+        them) would have disabled the guard globally.
+
+        The bar is ``min_samples`` — the same data-sufficiency threshold every
+        bucket must clear to be fitted at all, rather than a new invented constant.
+        """
+        return self.n_noref >= self.min_samples
 
     def fit(self, records: list[dict]) -> "Calibrator":
         """records: dicts with keys ``mode`` (FailureMode), ``signature`` (str),
-        ``z`` (float raw logit), ``label`` (0/1)."""
+        ``z`` (float raw logit), ``label`` (0/1).
+
+        Refitting REPLACES prior state. Accumulating instead let stale maps from a
+        discarded training set survive a refit and keep being served.
+        """
+        self.maps = {}
+        self.n_noref = 0
 
         groups: dict[tuple[str, str], list[tuple[float, int]]] = defaultdict(list)
         for r in records:
@@ -117,7 +139,8 @@ class Calibrator:
             # pooled map — the pooling this module exists to avoid.
             groups[(mode, _coarse(sig))].append((r["z"], int(r["label"])))
             groups[(mode, "__global__")].append((r["z"], int(r["label"])))
-            self.saw_noref = self.saw_noref or sig.endswith("|noref")
+            if sig.endswith("|noref"):
+                self.n_noref += 1
 
         for key, pairs in groups.items():
             if len(pairs) < self.min_samples:
@@ -189,7 +212,7 @@ class Calibrator:
         # 326/412 production-shape probabilities served by a pooled reference-bearing
         # map, ECE 0.0053 -> 0.0691. Falling through to the raw sigmoid is the honest
         # outcome: no map fits this trace, so do not pretend one does.
-        if self.saw_noref or not signature.endswith("|noref"):
+        if self.global_admits_noref or not signature.endswith("|noref"):
             ladder.append((mkey, "__global__"))
         for level, key in enumerate(ladder):
             m = self.maps.get(key)
@@ -204,8 +227,24 @@ class Calibrator:
         return bool(self.maps)
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_bytes(pickle.dumps(self.maps))
+        # The fitted maps alone are NOT the calibrator's state. Persisting only
+        # `maps` silently dropped n_noref (so a calibrator legitimately fitted on
+        # reference-free data denied itself the __global__ rung after a reload) and
+        # reset the data-sufficiency thresholds to defaults.
+        Path(path).write_bytes(pickle.dumps({
+            "maps": self.maps,
+            "n_noref": self.n_noref,
+            "min_samples": self.min_samples,
+            "isotonic_min": self.isotonic_min,
+        }))
 
     def load(self, path: str | Path) -> "Calibrator":
-        self.maps = pickle.loads(Path(path).read_bytes())
+        state = pickle.loads(Path(path).read_bytes())
+        if not isinstance(state, dict) or "maps" not in state:
+            self.maps = state           # a file written before state was versioned
+            return self
+        self.maps = state["maps"]
+        self.n_noref = state.get("n_noref", 0)
+        self.min_samples = state.get("min_samples", self.min_samples)
+        self.isotonic_min = state.get("isotonic_min", self.isotonic_min)
         return self

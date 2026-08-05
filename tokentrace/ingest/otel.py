@@ -46,7 +46,7 @@ exactly what it is.
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from tokentrace.core.types import Chunk, Inference
 from tokentrace.ingest.base import (
@@ -270,6 +270,21 @@ def _collect(attrs: Mapping[str, Any], payload: Any) -> tuple[list[dict[str, Any
     return inputs, outputs, form or "unknown"
 
 
+def _structured_chunks(payload: Any) -> "Optional[list[Chunk]]":
+    """The retriever's own documents off the span envelope, if it attached any.
+
+    Delegates to the LangChain adapter's document reader so the two stay in step —
+    it is the same document shape, just carried on a span instead of a chain output.
+    """
+    from tokentrace.ingest import langchain as _lc
+
+    documents = _lc._documents(payload)
+    if not isinstance(documents, (list, tuple)) or not documents:
+        return None
+    builder, _ = _lc._build_chunks(documents)
+    return builder.chunks or None
+
+
 # --------------------------------------------------------------------------- #
 def detect(payload: Any) -> bool:
     """True for a span carrying GenAI semantic-convention attributes or events."""
@@ -277,6 +292,12 @@ def detect(payload: Any) -> bool:
         return False
     if "tokentrace_field_map" in payload:
         return False
+    # NOTE: this adapter deliberately does NOT defer on structured retrieval the way
+    # openai_chat does. A GenAI span is the right home for a GenAI span even when an
+    # instrumented chain also attached the retriever's documents — no other adapter
+    # can read `gen_ai.*` attributes, so deferring would leave the payload claimed by
+    # nobody. Instead `to_inference` PREFERS those documents over prose re-parsing,
+    # which is where the real chunk boundaries and scores live.
     if any(key.startswith(GENAI_PREFIX) for key in attributes(payload)):
         return True
     return any(
@@ -323,8 +344,18 @@ def to_inference(payload: Any) -> Inference:
             question = texts[i].strip()
             break
 
+    # An instrumented RAG chain often attaches the retriever's OWN documents to the
+    # span. Those carry real chunk boundaries, scores and gold annotations, so they
+    # beat anything recovered by re-parsing the rendered prompt — discarding them
+    # left `retrieved_context` empty, which makes the engine hard-mask
+    # RETRIEVAL_FAILURE and CONTEXT_DILUTION to P=0 and renders the two modes the
+    # trace could exhibit undiagnosable rather than merely unsupported.
+    structured = _structured_chunks(payload)
+    if structured is not None:
+        chunks, origin = structured, "structured_documents"
+
     builder = ChunkBuilder()
-    builder.extend(chunks)  # parsed from a rendered prompt: no scores, no gold flags
+    builder.extend(chunks)  # from a rendered prompt: no scores, no gold flags
 
     # A GenAI span has no place to put a reference answer, but a harness that wrote
     # one onto the span envelope should still be honoured. Never derived.
