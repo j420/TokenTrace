@@ -63,6 +63,7 @@ from tokentrace.core.types import (
     Recommendation,
     Tier,
 )
+from tokentrace.recommend.recommender import INTERVENTIONS
 
 #: Fallback when the engine emitted no substantive evidence line at all (possible on a
 #: cold-start report whose ledger is just the base-rate prior). Kept as an explicit
@@ -231,6 +232,10 @@ class TriageReport:
     failures: list[TriageFailure] = field(default_factory=list)
     tier: Optional[Tier] = None
     detection_threshold: float = DEFAULT_DETECTION_THRESHOLD
+    #: "engine" (read off the engine), "explicit" (caller supplied), or
+    #: "assumed" (the facade exposed none, so the healthy/declined split rests
+    #: on a guess). Surfaced because "assumed" makes those two buckets soft.
+    threshold_origin: str = "engine"
     ranking_criterion: str = "n * mean_diagnostic_confidence"
     n_with_ground_truth: int = 0
     notes: list[str] = field(default_factory=list)
@@ -289,6 +294,7 @@ class TriageReport:
             "failure_rate": _fin(round(self.failure_rate, 4)),
             "tier": self.tier.label if self.tier is not None else None,
             "detection_threshold": _fin(self.detection_threshold),
+            "threshold_origin": self.threshold_origin,
             "ranking_criterion": self.ranking_criterion,
             "mode_counts": {m.value: self.mode_counts.get(m, 0) for m in ALL_MODES},
             "mode_share": {m.value: _fin(round(v, 4))
@@ -328,25 +334,44 @@ def _headline(report: DiagnosisReport) -> tuple[str, str, Optional[str], float]:
     return ev.signal, ev.source, ev.family.value, float(ev.contribution_logodds)
 
 
-def _chosen_recommendation(report: DiagnosisReport) -> Optional[Recommendation]:
-    """The single fix a developer should apply first for this trace.
+def _scored_recommendations(report: DiagnosisReport) -> list[Recommendation]:
+    """Every DISTINCT intervention on this trace, best-first.
 
-    Ordered by ``Recommendation.priority`` (which encodes the causal role: treat the
-    root before the sequela), then by the rank of the diagnosis carrying it, then by
-    template order. Exactly one recommendation per trace is scored, which sidesteps
-    the double-counting trap ``eval.metrics`` had to fix: several action keys resolve
-    to the same underlying callable in ``recommend.INTERVENTIONS``
-    (``ground_or_abstain`` *is* ``add_gold_context``), so counting per (mode, template)
-    would credit one simulated intervention twice.
+    An earlier version kept only the single highest-priority recommendation, on the
+    stated grounds that this "sidesteps the double-counting trap ``eval.metrics`` had
+    to fix". That rationale was wrong, and the cost was severe: ``eval/metrics.py``
+    dedupes by intervention *function identity*, which collapses the alias
+    (``ground_or_abstain`` resolves to the same callable as ``add_gold_context``)
+    while KEEPING genuinely distinct fixes. Taking one per trace instead discarded
+    interventions that had actually been applied, re-run and scored against ground
+    truth — so real observed negatives vanished into ``fix_unknown`` and the report
+    then printed a note asserting nothing had been measured. Measured on an ordinary
+    sweep: 5 of 12 diagnosed traces silently dropped a scored intervention.
+
+    Dedupe here matches metrics.py exactly: by the identity of the callable.
     """
-    best: Optional[Recommendation] = None
-    best_key: Optional[tuple[int, int, int]] = None
+    ordered: list[tuple[tuple[int, int, int], Recommendation]] = []
     for rank, diag in enumerate(report.diagnoses):
         for i, rec in enumerate(diag.recommendations):
-            k = (rec.priority, rank, i)
-            if best_key is None or k < best_key:
-                best_key, best = k, rec
-    return best
+            ordered.append(((rec.priority, rank, i), rec))
+    ordered.sort(key=lambda kv: kv[0])
+
+    seen: set[int] = set()
+    out: list[Recommendation] = []
+    for _key, rec in ordered:
+        fn = INTERVENTIONS.get(rec.action)
+        marker = id(fn) if fn is not None else hash(("advisory", rec.action))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(rec)
+    return out
+
+
+def _chosen_recommendation(report: DiagnosisReport) -> Optional[Recommendation]:
+    """The single fix a developer should apply first (drives ``dominant_action``)."""
+    scored = _scored_recommendations(report)
+    return scored[0] if scored else None
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +390,9 @@ class _Accum:
     fix_validated: int = 0
     fix_refuted: int = 0
     fix_unknown: int = 0
+    #: Interventions actually applied, re-run and scored (validated is not None).
+    #: Distinct from the per-trace split above, which counts TRACES.
+    n_scored_interventions: int = 0
     n_with_gt: int = 0
     n_non_rag: int = 0
     exemplars: list[str] = field(default_factory=list)
@@ -380,20 +408,26 @@ class _Accum:
         if len(self.exemplars) < max_exemplars:
             self.exemplars.append(trace_key)
 
-        rec = _chosen_recommendation(report)
-        if rec is None:
+        recs = _scored_recommendations(report)
+        if not recs:
             # No applicable fix at all -> nothing to verify, so it is unknown, not a
             # failed fix. (Happens when no diagnosis cleared the recommender's own
             # probability floor.)
             self.fix_unknown += 1
             return
-        self.actions[rec.action] += 1
-        if rec.validated is True:
+        # `dominant_action` answers "what should I do about this cluster", so it
+        # counts the first fix only. The verification split counts EVERY distinct
+        # intervention that was scored: discarding a measured negative because a
+        # higher-priority fix went unscored is how observed refutations disappeared.
+        self.actions[recs[0].action] += 1
+        outcomes = [r.validated for r in recs]
+        if True in outcomes:
             self.fix_validated += 1
-        elif rec.validated is False:
+        elif False in outcomes:
             self.fix_refuted += 1
         else:
             self.fix_unknown += 1
+        self.n_scored_interventions += sum(1 for o in outcomes if o is not None)
 
     def finish(self, n_diagnosed: int, max_exemplars: int) -> TriageCluster:
         n = len(self.confidences)
@@ -486,17 +520,28 @@ def triage(
     recorded in :attr:`TriageReport.failures` and the run continues;
     ``KeyboardInterrupt``/``SystemExit`` are deliberately *not* caught.
     """
+    threshold_origin = "explicit"
     if detection_threshold is None:
         engine = getattr(tt, "engine", None)
-        detection_threshold = float(
-            getattr(engine, "abstain_primary", DEFAULT_DETECTION_THRESHOLD))
+        engine_threshold = getattr(engine, "abstain_primary", None)
+        if engine_threshold is None:
+            # The facade did not expose its threshold, so we are about to invent the
+            # "second, disagreeing threshold" this function's contract promises never
+            # to invent. That guess splits healthy from declined, and guessing HIGH
+            # reports genuinely-declined traces as a clean fleet — the wrong direction
+            # for an observability tool. It is no longer silent.
+            detection_threshold = DEFAULT_DETECTION_THRESHOLD
+            threshold_origin = "assumed"
+        else:
+            detection_threshold = float(engine_threshold)
+            threshold_origin = "engine"
 
     accums: dict[tuple[str, str], _Accum] = {}
     mode_counts: dict[FailureMode, int] = {m: 0 for m in ALL_MODES}
     failures: list[TriageFailure] = []
     n_input = n_analyzed = n_failed = n_diagnosed = n_healthy = n_abstained = 0
     n_with_gt = 0
-    run_tier: Optional[Tier] = tier
+    run_tier: Optional[Tier] = None      # discovered from the reports, never assumed
 
     for index, trace in enumerate(traces):
         n_input += 1
@@ -517,7 +562,11 @@ def triage(
 
         n_analyzed += 1
         n_with_gt += int(trace.has_ground_truth)
-        if run_tier is None:
+        # The tier that RAN, not the tier requested. ModelHandle.with_tier only ever
+        # down-caps (min(tier, profile.max_tier)) -- the documented auto-degrade
+        # ladder -- so seeding this from the parameter let a fleet report claim
+        # white-box causal evidence for a run that never left grey-box.
+        if report.tier is not None and (run_tier is None or report.tier < run_tier):
             run_tier = report.tier
 
         if report.abstained:
@@ -558,6 +607,7 @@ def triage(
         n_diagnosed=n_diagnosed, n_healthy=n_healthy, n_abstained=n_abstained,
         mode_counts=mode_counts, clusters=clusters, failures=failures,
         tier=run_tier, detection_threshold=float(detection_threshold),
+        threshold_origin=threshold_origin,
         n_with_ground_truth=n_with_gt,
     )
     out.notes = _notes(out)
@@ -567,6 +617,12 @@ def triage(
 def _notes(rep: TriageReport) -> list[str]:
     """Surface the things that would otherwise be read off a table wrongly."""
     notes: list[str] = []
+    if rep.threshold_origin == "assumed" and (rep.n_healthy or rep.n_abstained):
+        notes.append(
+            f"The facade exposed no detection threshold, so healthy-vs-declined was "
+            f"split at an assumed {rep.detection_threshold:.2f}. Those two buckets "
+            f"({rep.n_healthy} healthy / {rep.n_abstained} declined) may not match the "
+            f"engine's own classification.")
     if rep.n_input == 0:
         notes.append("No traces supplied — nothing to triage.")
         return notes
