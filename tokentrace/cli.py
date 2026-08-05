@@ -77,10 +77,11 @@ def _parse_seeds(raw: str) -> tuple[int, ...]:
 def _open_text(path: str):
     """`open()` that reports why it could not, and keeps the file streamable."""
     try:
-        # utf-8-sig, matching ingest.load_traces: a BOM is common in files written by
-        # Windows tooling, and with plain utf-8 the first read returns ﻿ instead
-        # of "[", which misroutes a BOM'd JSON *array* into the JSONL branch and then
-        # fails on a line that is actually valid.
+        # utf-8-sig, matching ingest.load_traces. A BOM is routine in files written by
+        # Windows tooling, and under plain utf-8 it survives as the first character --
+        # so the one-byte format sniff below reads the BOM instead of the opening
+        # bracket, misroutes a BOM-prefixed JSON *array* into the JSONL branch, and
+        # then reports a parse error on a line that is perfectly valid.
         return open(path, encoding="utf-8-sig")
     except OSError as exc:
         _fail(f"cannot read {path}: {exc.strerror or exc}")
