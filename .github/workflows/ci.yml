@@ -31,7 +31,15 @@ jobs:
         run: ruff check tokentrace tests scripts
       - name: Test
         run: pytest -q
-      - name: Assert the Streamlit tests were not skipped
+      # Assert the app tests RAN, not that nothing skipped. The module-level
+      # importorskip makes every test in the file skip when streamlit is absent,
+      # which is the failure we care about; but the file also contains a legitimate
+      # conditional skip, so grepping for the word "skipped" would fail a healthy
+      # run. Requiring at least one PASS distinguishes the two.
+      - name: Assert the Streamlit tests actually ran
         run: |
-          pytest tests/test_app.py -q -rs 2>&1 | tee /tmp/app.log
-          grep -q "skipped" /tmp/app.log && { echo "app tests skipped in CI"; exit 1; } || true
+          pytest tests/test_app.py -q 2>&1 | tee /tmp/app.log
+          grep -qE '[0-9]+ passed' /tmp/app.log || {
+            echo "::error::no app test passed — streamlit missing, so the whole file skipped"
+            exit 1
+          }
