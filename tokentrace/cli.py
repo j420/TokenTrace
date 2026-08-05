@@ -132,9 +132,13 @@ def cmd_ablate(args) -> int:
     print("learned-head ablation (white-box):")
     for k, v in al.items():
         print(f"  {k:16s} diagnosis={v['diagnosis_accuracy']:.3f}  top3={v['top3_accuracy']:.3f}")
-    print("\nper-signal-family ablation (drop one family; lower diagnosis = more load-bearing):")
-    for f, v in res["per_family_dropped"].items():
-        print(f"  drop {f:12s} diagnosis={v['diagnosis_accuracy']:.3f}")
+    print("\nper-signal-family ablation — two distinct questions:")
+    print("  (a) retrained leave-one-out = the family's INFORMATION contribution")
+    for f, v in res["per_family_retrained"].items():
+        print(f"      drop {f:12s} diagnosis={v['diagnosis_accuracy']:.3f}")
+    print("  (b) missing-signal robustness = how the SHIPPED engine copes (no retrain)")
+    for f, v in res["per_family_robustness"].items():
+        print(f"      drop {f:12s} diagnosis={v['diagnosis_accuracy']:.3f}")
     print(f"\ncalibration ECE: {res['calibration']}")
     print("per-tier:")
     for t, v in res["per_tier"].items():
