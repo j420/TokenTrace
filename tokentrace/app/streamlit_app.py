@@ -50,9 +50,25 @@ def _supported(fn, **kwargs) -> dict:
 
 
 def _fit(fn) -> dict:
-    """Width kwargs for a full-width element, whichever spelling this version uses."""
-    kw = _supported(fn, width="stretch")
-    return kw or _supported(fn, use_container_width=True)
+    """Width kwargs for a full-width element, whichever spelling this version uses.
+
+    Detecting the NAME ``width`` is not enough, and assuming it was cost this app its
+    whole supported range below Streamlit 1.49: ``width`` existed long before
+    ``"stretch"`` was legal, typed ``int | None`` (pixels). Passing the string into
+    that int protobuf field raises ``TypeError: 'str' object cannot be interpreted as
+    an integer`` at the first table — the app crashed rather than degraded on every
+    version ``pyproject.toml`` allows. So detect the SEMANTICS: only the modern
+    parameter carries a string default.
+    """
+    import inspect
+
+    try:
+        param = inspect.signature(fn).parameters.get("width")
+    except (TypeError, ValueError):
+        param = None
+    if param is not None and isinstance(param.default, str):
+        return {"width": "stretch"}
+    return _supported(fn, use_container_width=True)
 
 
 @st.cache_resource(show_spinner="Training engine on the offline synthetic corpus…")

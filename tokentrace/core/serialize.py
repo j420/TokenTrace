@@ -133,9 +133,16 @@ def labeled_to_dict(li: LabeledInference) -> dict[str, Any]:
 # --------------------------- from dict --------------------------- #
 def chunk_from_dict(d: dict[str, Any]) -> Chunk:
     span = d.get("char_span")
+    # `.get(k, default)` does NOT cover an explicit null, and `chunk_to_dict` now
+    # writes one whenever _fin scrubs a non-finite score. Without this the round trip
+    # returned retriever_score=None -- violating the float annotation, and worse,
+    # changing TraceStore.make_key's hash, so a reloaded trace could never be found
+    # in the cache again and every re-save minted a new file. Every other _fin-scrubbed
+    # field already had this guard on the way back in; this one was missed.
+    score = d.get("retriever_score")
     return Chunk(
         text=d["text"],
-        retriever_score=d.get("retriever_score", 0.0),
+        retriever_score=0.0 if score is None else score,
         source_id=d.get("source_id", ""),
         gold=d.get("gold"),
         char_span=tuple(span) if span else None,

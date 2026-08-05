@@ -13,6 +13,7 @@ Depends only on the standard library + the core contracts.
 from __future__ import annotations
 
 import hashlib
+import math
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -47,6 +48,18 @@ def feature_vector_from_dict(d: dict[str, Any]) -> FeatureVector:
     return fv
 
 
+def _canonical_score(x):
+    """The score as it will exist AFTER a save/load cycle.
+
+    Not simply ``_fin``: ``chunk_to_dict`` writes a non-finite score as null and
+    ``chunk_from_dict`` reads null back as ``0.0``, so the value that survives is
+    ``0.0``. Keying on the raw in-memory value instead gave a trace one key before
+    the save and another after the reload — a permanent cache miss plus a fresh file
+    on every re-save, on exactly the pre-compute-once workflow this class exists for.
+    """
+    return 0.0 if isinstance(x, float) and not math.isfinite(x) else x
+
+
 class TraceStore:
     def __init__(self, root: str | Path = ".tokentrace_cache"):
         self.root = Path(root)
@@ -58,8 +71,13 @@ class TraceStore:
         # gold/source_id/retriever_score and the question — so two inferences with
         # the same prompt text but different gold-marking don't collide to a stale
         # trace (rag.make_inference toggles exactly that).
+        # Key off the score as it survives a save/load cycle, not the in-memory value:
+        # otherwise a reloaded trace hashes differently and can never be found again —
+        # a permanent miss plus unbounded growth on the workflow this class exists
+        # for. See `_canonical_score`.
         ctx = (
-            [[c.text, c.gold, c.source_id, c.retriever_score] for c in inference.retrieved_context]
+            [[c.text, c.gold, c.source_id, _canonical_score(c.retriever_score)]
+             for c in inference.retrieved_context]
             if inference.retrieved_context is not None else None
         )
         payload = json.dumps({
