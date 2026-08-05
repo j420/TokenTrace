@@ -127,11 +127,25 @@ def strip_reference(obj: _StripTarget, *, drop_gold_flags: bool = True,
     The mock needs them to generate, resample and produce mechanistic captures at
     all — a real backend ignores ``_sim`` entirely and reads the same information
     out of its own weights and activations. Removing it would not simulate "no
-    reference", it would simulate "no model". Crucially, ``grep -rn '_sim'``
-    shows it is read only by ``models/mock.py``, ``recommend/recommender.py``,
-    ``data/injection.py`` and the CLI scenario builder: **no signal extractor in
-    ``signals/`` ever reads it**, so nothing that reaches the diagnosis engine can
-    recover the reference through it. The stripping is therefore genuine.
+    reference", it would simulate "no model".
+
+    **Be precise about what that does and does not guarantee.** No module under
+    ``signals/`` reads ``_sim`` directly, but that is not the same as "no leakage
+    path", which an earlier revision of this docstring claimed. The extractors call
+    ``model.capture()`` and ``model.sample()``, and ``MockModel._decide`` reads
+    ``_sim["gold_fact"]`` — so ``gold_present`` (and through it
+    ``gold_attention_ratio``, ``external_context_score``,
+    ``parametric_knowledge_score`` and the logit-lens features) is reconstructed
+    from ``_sim`` after ``Chunk.gold`` is gone. Measured: ``gold_present`` is True on
+    the same 51 of 86 test rows before and after stripping. The reference string also
+    survives verbatim in the rendered prompt on 54/86 rows and in the context on
+    53/86 — necessarily so, since a production trace really does contain whatever
+    text the model was shown.
+
+    The honest framing is that this measures **"how well would the shipped engine
+    have diagnosed these traces had it not been given their reference *metadata*"**,
+    with a mock whose internal states stay as informative as a real model's. It is
+    not a claim that every channel carrying answer-related information was severed.
 
     ``drop_gold_flags=False`` keeps the gold annotations and removes only the
     reference; ``drop_ground_truth=False`` does the mirror image. Neither is a
@@ -321,7 +335,14 @@ def run_noref(
     # simulated model's behaviour — something that cannot happen in production,
     # where a real model never sees an annotation. These two isolates separate
     # that artifact from the genuine loss of diagnostic information.
-    reference_only = score(shipped, strip_dataset(test, drop_gold_flags=False))[0]
+    # mark_unavailable applies to ANY metrics dict computed on reference-stripped
+    # traces, this control included: it drops the reference, so every recommendation
+    # goes unscored and `recommendation_precision` fell out of compute_metrics as a
+    # bare 0.0 — the "catastrophic-looking score where the truth is 'not measurable'"
+    # that the UNAVAILABLE marker exists to prevent, emitted in the same output that
+    # explains why it must not be.
+    reference_only = mark_unavailable(score(shipped, strip_dataset(test, drop_gold_flags=False))[0])
+    # This one KEEPS the reference, so its recommendation metrics are real.
     annotations_only = score(shipped, strip_dataset(test, drop_ground_truth=False))[0]
 
     mock_decisions_changed: Counter = Counter()

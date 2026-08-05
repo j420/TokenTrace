@@ -323,7 +323,7 @@ def test_noref_trace_is_not_served_a_reference_only_pooled_map():
     from tokentrace.engine.calibration import Calibrator
 
     cal = Calibrator().fit(_cal_records("confidence+prompt+retrieval"))
-    assert cal.is_fitted and not cal.saw_noref
+    assert cal.is_fitted and not cal.global_admits_noref
     assert ("hallucination", "__global__") in cal.maps, "precondition: a global map exists"
 
     cal.transform(FailureMode.HALLUCINATION, "confidence+prompt+retrieval", 1.0)
@@ -346,8 +346,56 @@ def test_noref_trace_may_use_the_global_map_once_noref_data_was_fitted():
     mixed = _cal_records("confidence+prompt+retrieval") + \
         _cal_records("confidence+prompt|noref")
     cal = Calibrator().fit(mixed)
-    assert cal.saw_noref
+    assert cal.global_admits_noref
 
-    # A signature with no map of its own, but the pool now contains noref records.
+    # Delete the coarse __noref__ map so the trace MUST reach the __global__ rung.
+    # Without this the test passed even when the guard denied __global__ outright,
+    # because the coarse rung caught the trace first — it never exercised the rung
+    # it is named for.
+    cal.maps.pop((FailureMode.HALLUCINATION.value, "__noref__"), None)
     cal.transform(FailureMode.HALLUCINATION, "prompt+retrieval|noref", 1.0)
-    assert cal.last_fallback < 3, "global rung should be admissible once noref was fitted"
+    assert cal.last_fallback == 2, (
+        f"expected the __global__ rung (2), got {cal.last_fallback}; the guard must "
+        "not deny a pool that genuinely contains reference-free records")
+
+
+def test_a_single_stray_noref_record_does_not_re_open_the_pooled_map():
+    """The guard must test the pool's COMPOSITION, not merely that it saw one such
+    record. 400 reference-bearing records plus 1 reference-free one produced a
+    99.75%-reference-bearing __global__ that a presence-test happily served — the
+    original bug, restored by a weaker predicate. One row with ground_truth=None in
+    the calibration split (load_ragtruth produces them) would have sufficed."""
+    from tokentrace.core.types import FailureMode
+    from tokentrace.engine.calibration import Calibrator
+
+    cal = Calibrator().fit(_cal_records("confidence+prompt+retrieval", 400)
+                           + _cal_records("confidence+prompt|noref", 1))
+    assert not cal.global_admits_noref, "one stray record must not admit the pooled map"
+    cal.transform(FailureMode.HALLUCINATION, "prompt+retrieval|noref", 1.0)
+    assert cal.last_fallback == 3
+
+
+def test_refitting_a_calibrator_replaces_rather_than_accumulates():
+    """Stale maps from a discarded training set survived a refit and kept being
+    served, and a stale noref count kept the guard disabled."""
+    from tokentrace.engine.calibration import Calibrator
+
+    cal = Calibrator().fit(_cal_records("prompt|noref", 200))
+    assert cal.global_admits_noref
+    cal.fit(_cal_records("confidence+prompt+retrieval", 200))
+    assert not cal.global_admits_noref, "noref count survived a refit on reference data"
+    assert not [k for k in cal.maps if "noref" in k[1]], "stale noref maps survived a refit"
+
+
+def test_saving_a_calibrator_round_trips_the_guard_state(tmp_path):
+    """save() pickled only `maps`, so a calibrator legitimately fitted on
+    reference-free data denied itself the __global__ rung after a reload."""
+    from tokentrace.engine.calibration import Calibrator
+
+    path = tmp_path / "cal.pkl"
+    original = Calibrator().fit(_cal_records("prompt|noref", 200))
+    original.save(path)
+    restored = Calibrator().load(path)
+    assert restored.n_noref == original.n_noref
+    assert restored.global_admits_noref == original.global_admits_noref
+    assert restored.min_samples == original.min_samples
