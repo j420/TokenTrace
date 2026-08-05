@@ -50,6 +50,8 @@ from tokentrace.ingest.base import (
     first_text,
     gold_flag,
     ingest_meta,
+    message_role,
+    message_text,
     missing_field,
     register,
 )
@@ -79,7 +81,23 @@ _SOURCE_KEYS = ("source", "file_path", "file_name", "doc_id", "document_id", "id
 
 
 def _looks_like_document(value: Any) -> bool:
-    return isinstance(value, Mapping) and ("page_content" in value or "pageContent" in value)
+    """Anything ``_build_chunks`` can actually turn into a chunk.
+
+    This deliberately mirrors what the builder accepts rather than demanding
+    ``page_content``. When it demanded that key, ``detect`` rejected shapes that
+    ``to_inference`` parses perfectly — a RAGAS row (``contexts: ["...", "..."]``,
+    the single most common eval-log format) and a ``{"text": ...}``-keyed document
+    both parsed but could never be auto-routed.
+    """
+    if isinstance(value, str):
+        return bool(value.strip())
+    # Exactly the keys _build_chunks reads below, and no more. Adding a key the
+    # builder does not read (`body`) made this claim payloads it cannot parse —
+    # notably a generic field-map trace, which must stay unclaimed so the explicit
+    # map routes it.
+    return isinstance(value, Mapping) and any(
+        k in value for k in ("page_content", "pageContent", "text", "content")
+    )
 
 
 def _documents(payload: Any) -> Any:
@@ -142,12 +160,19 @@ def detect(payload: Any) -> bool:
             return False
     if isinstance(payload.get("attributes"), (Mapping, list)):
         return False
-    if first_text(payload, _ANSWER_PATHS) is None:
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else None
+    has_answer = first_text(payload, _ANSWER_PATHS) is not None
+    if not has_answer and messages:
+        # The answer may be the trailing assistant turn rather than a `result` key.
+        # Requiring the key left a real shape unclaimed by EVERY adapter: openai_chat
+        # defers on the documents, and this one refused for want of `result`.
+        has_answer = _last_message_text(messages, "assistant") is not None
+    if not has_answer:
         return False
 
     documents = _documents(payload)
     if isinstance(documents, (list, tuple)) and documents:
-        # Documents present: they must actually look like LangChain Documents.
+        # Documents present: they must actually look like retrieved documents.
         return any(_looks_like_document(d) for d in documents)
     if "messages" in payload or "choices" in payload:
         return False  # a chat log with no retrieval structure -> openai_chat's job
@@ -155,14 +180,35 @@ def detect(payload: Any) -> bool:
     return first_text(payload, _QUESTION_PATHS) is not None
 
 
+def _last_message_text(messages: list, role: str) -> Optional[str]:
+    """Text of the LAST message with this role — the live turn, not the first."""
+    for message in reversed(messages):
+        if message_role(message) == role:
+            text = message_text(message)
+            if text:
+                return text
+    return None
+
+
 def to_inference(payload: Any) -> Inference:
     if not isinstance(payload, Mapping):
         raise missing_field(SOURCE, "chain output object", ("<root>",), payload)
 
+    # A callback log may carry the chat transcript instead of a `question` field.
+    # Since `openai_chat` correctly defers whenever structured retrieval is present,
+    # this adapter has to be able to read that transcript, or such a payload routes
+    # here and then fails — parseable by one adapter, claimed by another.
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else None
     answer = first_text(payload, _ANSWER_PATHS)
+    if answer is None and messages:
+        answer = _last_message_text(messages, "assistant")
     if answer is None:
         raise missing_field(SOURCE, "generated answer", _ANSWER_PATHS, payload)
     question = first_text(payload, _QUESTION_PATHS)
+    question_origin = "question_field"
+    if question is None and messages:
+        question = _last_message_text(messages, "user")
+        question_origin = "last_user_message"
     if question is None:
         raise missing_field(SOURCE, "user question", _QUESTION_PATHS, payload)
 
@@ -191,7 +237,7 @@ def to_inference(payload: Any) -> Inference:
             model_name=content_text(first_present(payload, _MODEL_PATHS)) or None,
             context_origin=context_origin,
             prompt_origin=prompt_origin,
-            question_origin="question_field",
+            question_origin=question_origin,
             builder=builder,
             reference=reference,
             extra={"chain": content_text(first_present(payload, ("chain", "chain_type"))) or None},

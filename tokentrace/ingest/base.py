@@ -101,6 +101,32 @@ def missing_field(source: str, what: str, tried: Sequence[str], payload: Any) ->
     )
 
 
+#: Keys meaning "this payload carries STRUCTURED retrieval" — the retriever's own
+#: chunk boundaries and scores. An adapter that can only re-parse a rendered prompt
+#: must defer on these, because discarding real chunk boundaries is not a cosmetic
+#: loss: leaving ``retrieved_context is None`` makes the engine hard-mask
+#: RETRIEVAL_FAILURE and CONTEXT_DILUTION to P=0, so the two modes the trace could
+#: exhibit become undiagnosable rather than merely unsupported.
+#:
+#: This must stay a superset of every document/node path the structured adapters
+#: actually read (``langchain._DOC_PATHS``, ``llamaindex._NODE_PATHS``). A test
+#: enforces that, because the lists drifted apart once already: ``openai_chat``
+#: deferred on 3 of langchain's 6 document keys and ``otel`` deferred on none, so a
+#: scored, gold-annotated document set was silently discarded in favour of prose
+#: re-parsing.
+STRUCTURED_RETRIEVAL_KEYS: tuple[str, ...] = (
+    "source_documents", "source_nodes", "page_content",
+    "context", "contexts", "documents", "docs", "nodes", "sources",
+)
+
+
+def defers_to_structured_retrieval(payload: Any) -> bool:
+    """True if some other adapter can recover real chunk boundaries from this payload."""
+    if not isinstance(payload, Mapping):
+        return False
+    return any(k in payload for k in STRUCTURED_RETRIEVAL_KEYS)
+
+
 # --------------------------------------------------------------------------- #
 # Path resolution
 # --------------------------------------------------------------------------- #
@@ -279,13 +305,19 @@ def normalize_reference(value: Any) -> Optional[list[str]]:
     ``Inference.has_ground_truth`` already treats ``[]``/``[""]`` as absent; we
     normalize them to ``None`` here so the two representations never diverge.
     """
-    if value is None:
+    if value is None or isinstance(value, bool):
+        # bool is an int subclass, so `{"expected": true}` would otherwise become the
+        # reference answer "True". Keys like `expected` and `reference` hold flags in
+        # ordinary eval logs, and a fabricated reference is not a cosmetic error: it
+        # flips `reference_available`, DROPS the |noref calibration signature, and
+        # scores `is_correct` / `gold_recall_in_context` against the literal "True".
         return None
     if isinstance(value, str):
         text = value.strip()
         return [text] if text else None
     if isinstance(value, (list, tuple)):
-        out = [str(v).strip() for v in value if isinstance(v, (str, int, float))]
+        out = [str(v).strip() for v in value
+               if isinstance(v, (str, int, float)) and not isinstance(v, bool)]
         out = [v for v in out if v]
         return out or None
     if isinstance(value, (int, float)):
