@@ -29,6 +29,32 @@ _MODE_COLOR = {
 }
 
 
+def _supported(fn, **kwargs) -> dict:
+    """Keep only the kwargs this installed Streamlit actually accepts.
+
+    Streamlit's layout API is a moving target across the versions a user might
+    have: ``use_container_width`` was deprecated with a removal date that has now
+    passed and is superseded by ``width="stretch"``, and ``bar_chart(horizontal=)``
+    only exists on newer releases. Pinning a narrow version floor to dodge that
+    would be worse than adapting — the app is a demo, not a library, and it should
+    render on whatever the user already has. So we feature-detect per call instead
+    of encoding version numbers we would have to keep correct.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):       # builtins / C-implemented: pass nothing extra
+        return {}
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _fit(fn) -> dict:
+    """Width kwargs for a full-width element, whichever spelling this version uses."""
+    kw = _supported(fn, width="stretch")
+    return kw or _supported(fn, use_container_width=True)
+
+
 @st.cache_resource(show_spinner="Training engine on the offline synthetic corpus…")
 def get_engine(backend: str, model_name: str, train: bool) -> TokenTrace:
     return TokenTrace.default(backend=backend, model_name=model_name, tier=Tier.WHITE, train=train)
@@ -99,7 +125,8 @@ def main() -> None:
 
     # ---- ranked diagnoses ---- #
     st.subheader("Ranked root-cause diagnoses")
-    st.bar_chart({d.mode.pretty: d.probability for d in report.diagnoses}, horizontal=True)
+    st.bar_chart({d.mode.pretty: d.probability for d in report.diagnoses},
+                 **_supported(st.bar_chart, horizontal=True))
 
     for d in report.diagnoses:
         if d.probability < 0.15:
@@ -114,7 +141,7 @@ def main() -> None:
                     [{"signal": e.signal, "family": e.family.value,
                       "Δ log-odds": round(e.contribution_logodds, 3),
                       "source": e.source, "detail": e.rendered} for e in d.evidence],
-                    use_container_width=True, hide_index=True,
+                    hide_index=True, **_fit(st.dataframe),
                 )
             for r in d.recommendations:
                 _render_recommendation(tt, inf, r)
@@ -129,7 +156,7 @@ def main() -> None:
         fv = tt.features(inf, tier=tier)
         st.markdown(f"missingness signature: `{fv.missingness_signature()}`")
         st.dataframe([{"feature": k, "value": v} for k, v in sorted(fv.values.items())],
-                     use_container_width=True, hide_index=True)
+                     hide_index=True, **_fit(st.dataframe))
 
 
 def _render_recommendation(tt: TokenTrace, inf, rec) -> None:
@@ -140,11 +167,19 @@ def _render_recommendation(tt: TokenTrace, inf, rec) -> None:
         modified = INTERVENTIONS[rec.action](inf)
         if modified is None:
             st.write("No structural fix available — recommend the model abstain.")
+            return
+        new_answer = tt.model.bound_to(modified).generate(modified.prompt).text
+        # Three outcomes, not two. Without ground truth we cannot say whether the fix
+        # worked, and rendering "unknown" in success green (as this did) overstates the
+        # result on exactly the traces a production user brings — where there is no
+        # reference to check against.
+        rec_er = tt.engine.recommender
+        if rec_er is None or not inf.has_ground_truth:
+            st.info(f"After fix, answer → `{new_answer}` · outcome unknown (no ground truth)")
+        elif rec_er._correct(new_answer, inf.ground_truth):
+            st.success(f"After fix, answer → `{new_answer}` · ✅ now correct")
         else:
-            new_answer = tt.model.bound_to(modified).generate(modified.prompt).text
-            ok = inf.has_ground_truth and tt.engine.recommender._correct(new_answer, inf.ground_truth) \
-                if tt.engine.recommender else False
-            st.success(f"After fix, answer → `{new_answer}`" + ("  ✅ now correct" if ok else ""))
+            st.warning(f"After fix, answer → `{new_answer}` · ❌ still wrong")
 
 
 if __name__ == "__main__":

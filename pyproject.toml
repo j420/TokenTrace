@@ -34,8 +34,11 @@ mechanistic = ["torch>=2.2", "transformers>=4.44", "nnsight>=0.3"]
 retrieval = ["faiss-cpu>=1.8", "sentence-transformers>=3.0"]
 # Prompt-signal helpers.
 prompt = ["spacy>=3.7"]
-# Interactive developer tool.
-app = ["streamlit>=1.36", "plotly>=5.22", "pandas>=2.0"]
+# Interactive developer tool. Streamlit only: the app renders through st.bar_chart
+# and st.dataframe (which take plain dicts/lists), so the previously declared plotly
+# and pandas were never imported by any code path. Layout kwargs are feature-detected
+# at call time rather than pinned, so no narrow version floor is needed here.
+app = ["streamlit>=1.36"]
 # Dataset loaders (RAGTruth, HotpotQA, NQ, TruthfulQA, BEIR).
 data = ["datasets>=2.20"]
 dev = ["pytest>=8.0", "ruff>=0.5", "mypy>=1.10"]
