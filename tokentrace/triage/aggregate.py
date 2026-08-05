@@ -91,12 +91,27 @@ def _fin(x: Any) -> Any:
     return x
 
 
-def _mean(xs: list[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
+def _mean(total: float, n: int) -> float:
+    """Mean from a running sum (see :class:`_Accum` for why nothing is retained)."""
+    return total / n if n else 0.0
 
 
 def _rate(num: int, den: int) -> float:
     return num / den if den else 0.0
+
+
+def _num(x: float, spec: str, width: int) -> str:
+    """Format a float for the text table, rendering a non-finite value as ``n/a``.
+
+    :func:`_fin` scrubs NaN/inf to ``null`` on the JSON side, but the table used a
+    bare format spec and printed ``+nan`` / ``nan%``. The two surfaces then disagreed
+    about the same guarantee — one said "this number does not exist", the other
+    printed something that looks like a measurement — so a reader comparing them
+    could not tell which to believe. Both now say "we do not have this number".
+    """
+    if isinstance(x, float) and not math.isfinite(x):
+        return f"{'n/a':>{width}s}"
+    return format(x, spec)
 
 
 # --------------------------------------------------------------------------- #
@@ -140,7 +155,14 @@ class TriageCluster:
     headline_source: str = "rule"        # "rule" | "learned" | "prior" | "aggregate"
     headline_family: Optional[str] = None
     n: int = 0
-    share: float = 0.0                   # of DIAGNOSED traces, not of all input
+    share: float = 0.0                   # n / share_denominator
+    #: The denominator ``share`` is taken over: :attr:`TriageReport.n_diagnosed`, NOT
+    #: the number of traces supplied. Carried as a field (and emitted next to
+    #: ``share`` by :meth:`to_dict`) because an unlabelled ratio is read as a share of
+    #: the fleet: measured on 100 traces / 60 diagnosed, a 30-trace cluster renders as
+    #: 50%, and a reader who assumes "/ n_input" concludes 30% of production is
+    #: affected. The number is right; the missing denominator made it a lie.
+    share_denominator: int = 0
     mean_diagnostic_confidence: float = 0.0
     mean_primary_probability: float = 0.0
     mean_headline_logodds: float = 0.0   # signed: a headline line can OPPOSE the mode
@@ -151,6 +173,10 @@ class TriageCluster:
     fix_validated: int = 0               # MEASURED: intervention applied, answer corrected
     fix_refuted: int = 0                 # MEASURED: intervention applied, answer still wrong
     fix_unknown: int = 0                 # never scored (no ground truth / nothing to fix)
+    #: MEASURED: distinct interventions that were applied, re-run and scored. Counts
+    #: INTERVENTIONS, not traces — one trace can carry several distinct fixes — so it
+    #: is not part of the ``fix_*`` partition above and can exceed ``n``.
+    n_scored_interventions: int = 0
     n_with_ground_truth: int = 0         # why impact is (un)knowable for this cluster
     n_non_rag: int = 0
     exemplar_ids: list[str] = field(default_factory=list)
@@ -189,7 +215,11 @@ class TriageCluster:
             "headline_source": self.headline_source,
             "headline_family": self.headline_family,
             "n": self.n,
+            # The denominator is part of the number, so it ships with it: a bare
+            # "share" is read as a share of the fleet (see `share_denominator`).
             "share": _fin(round(self.share, 4)),
+            "share_of": "n_diagnosed",
+            "share_denominator": self.share_denominator,
             "mean_diagnostic_confidence": _fin(round(self.mean_diagnostic_confidence, 4)),
             "mean_primary_probability": _fin(round(self.mean_primary_probability, 4)),
             "mean_headline_logodds": _fin(round(self.mean_headline_logodds, 4)),
@@ -200,6 +230,7 @@ class TriageCluster:
             "fix_validated": self.fix_validated,
             "fix_refuted": self.fix_refuted,
             "fix_unknown": self.fix_unknown,
+            "n_scored_interventions": self.n_scored_interventions,
             "measured_impact": self.measured_impact,     # None == not measured
             "impact_status": self.impact_status,
             "n_with_ground_truth": self.n_with_ground_truth,
@@ -238,16 +269,29 @@ class TriageReport:
     threshold_origin: str = "engine"
     ranking_criterion: str = "n * mean_diagnostic_confidence"
     n_with_ground_truth: int = 0
+    #: The iterable of traces itself raised, so iteration stopped early and every
+    #: count here describes only what was read before that. Surfaced because
+    #: ``failure_rate`` is otherwise silently computed against a truncated log.
+    input_stream_failed: bool = False
     notes: list[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     @property
     def abstention_rate(self) -> float:
-        """Share of analyzed traces the engine declined to diagnose, healthy ones included.
+        """Share of analyzed traces that got no named root cause, healthy ones included.
 
-        This is the headline honesty number: it matches ``DiagnosisReport.abstained``
-        one-for-one, so a run that abstained on 60% of its input says so loudly rather
-        than quietly reporting a five-mode distribution over the other 40%.
+        This is the headline honesty number: a run that produced no diagnosis for 60%
+        of its input says so loudly rather than quietly reporting a five-mode
+        distribution over the other 40%.
+
+        It is *almost* ``DiagnosisReport.abstained`` one-for-one, and the docstring
+        used to claim exactly that — but one shape breaks the identity: a report that
+        did NOT set ``abstained`` yet carries no rankable diagnosis at all is counted
+        in ``n_abstained`` too, because from the reader's side nothing was diagnosed
+        either way. :class:`~tokentrace.engine.diagnosis.DiagnosisEngine` always emits
+        all five modes so it cannot produce that shape; a third-party facade can. The
+        numerator is therefore ``n_healthy + n_abstained``, which is the honest
+        quantity, rather than a literal count of the ``abstained`` flag.
         """
         return _rate(self.n_healthy + self.n_abstained, self.n_analyzed)
 
@@ -288,6 +332,7 @@ class TriageReport:
             "n_healthy": self.n_healthy,
             "n_abstained": self.n_abstained,
             "n_with_ground_truth": self.n_with_ground_truth,
+            "input_stream_failed": self.input_stream_failed,
             "abstention_rate": _fin(round(self.abstention_rate, 4)),
             "healthy_rate": _fin(round(self.healthy_rate, 4)),
             "declined_rate": _fin(round(self.declined_rate, 4)),
@@ -379,13 +424,25 @@ def _chosen_recommendation(report: DiagnosisReport) -> Optional[Recommendation]:
 # --------------------------------------------------------------------------- #
 @dataclass
 class _Accum:
+    """Per-cluster running state. Bounded: O(1) per cluster, O(0) per trace.
+
+    The three means are kept as running SUMS, not as lists of per-trace values. That
+    is not a micro-optimization — it is what makes the header above true. This module
+    promises a fleet log is "consumed lazily, so a 10k-row JSONL generator never has
+    to be materialized", and retaining three floats per trace quietly broke that
+    promise for the only shape that matters (measured: 200k traces landing in one
+    cluster held three 200k-element lists). The only structure that grows with traces
+    is ``exemplars``, capped at ``max_exemplars`` on the way in.
+    """
+
     mode: FailureMode
     signal: str
     source: str
     family: Optional[str]
-    confidences: list[float] = field(default_factory=list)
-    primaries: list[float] = field(default_factory=list)
-    logodds: list[float] = field(default_factory=list)
+    n: int = 0
+    sum_confidence: float = 0.0
+    sum_primary: float = 0.0
+    sum_logodds: float = 0.0
     actions: Counter = field(default_factory=Counter)
     fix_validated: int = 0
     fix_refuted: int = 0
@@ -399,39 +456,59 @@ class _Accum:
 
     def add(self, trace: Inference, report: DiagnosisReport, logodds: float,
             trace_key: str, max_exemplars: int) -> None:
-        primary = report.primary
-        self.confidences.append(float(report.diagnostic_confidence))
-        self.primaries.append(float(primary.probability) if primary is not None else 0.0)
-        self.logodds.append(logodds)
-        self.n_with_gt += int(trace.has_ground_truth)
-        self.n_non_rag += int(not trace.is_rag)
-        if len(self.exemplars) < max_exemplars:
-            self.exemplars.append(trace_key)
+        """Fold one trace into the cluster — all-or-nothing.
 
+        Every value is read and coerced BEFORE any field is mutated. A malformed
+        report raising halfway through (``diagnostic_confidence=None`` out of a
+        hand-rolled ingest adapter is the realistic case) would otherwise leave the
+        cluster having counted a trace it never finished adding, so its ``n`` and its
+        ``fix_*`` split would disagree — an invariant the module docstring asks
+        reviewers to check. :func:`triage` catches the exception; this keeps the
+        state it is catching on top of consistent.
+        """
+        confidence = float(report.diagnostic_confidence)
+        primary = report.primary
+        primary_probability = float(primary.probability) if primary is not None else 0.0
+        contribution = float(logodds)
+        has_gt = int(bool(trace.has_ground_truth))
+        non_rag = int(not trace.is_rag)
+        key = str(trace_key)
+
+        # `dominant_action` answers "what should I do about this cluster", so it
+        # counts the first fix only. The verification split counts EVERY distinct
+        # intervention that was scored: discarding a measured negative because a
+        # higher-priority fix went unscored is how observed refutations disappeared.
         recs = _scored_recommendations(report)
-        if not recs:
+        outcomes = [r.validated for r in recs]
+        action = recs[0].action if recs else None
+        scored = sum(1 for o in outcomes if o is not None)
+
+        # ---- commit: nothing below this line can raise ---- #
+        self.n += 1
+        self.sum_confidence += confidence
+        self.sum_primary += primary_probability
+        self.sum_logodds += contribution
+        self.n_with_gt += has_gt
+        self.n_non_rag += non_rag
+        if len(self.exemplars) < max_exemplars:
+            self.exemplars.append(key)
+        if action is None:
             # No applicable fix at all -> nothing to verify, so it is unknown, not a
             # failed fix. (Happens when no diagnosis cleared the recommender's own
             # probability floor.)
             self.fix_unknown += 1
             return
-        # `dominant_action` answers "what should I do about this cluster", so it
-        # counts the first fix only. The verification split counts EVERY distinct
-        # intervention that was scored: discarding a measured negative because a
-        # higher-priority fix went unscored is how observed refutations disappeared.
-        self.actions[recs[0].action] += 1
-        outcomes = [r.validated for r in recs]
+        self.actions[action] += 1
         if True in outcomes:
             self.fix_validated += 1
         elif False in outcomes:
             self.fix_refuted += 1
         else:
             self.fix_unknown += 1
-        self.n_scored_interventions += sum(1 for o in outcomes if o is not None)
+        self.n_scored_interventions += scored
 
-    def finish(self, n_diagnosed: int, max_exemplars: int) -> TriageCluster:
-        n = len(self.confidences)
-        mean_conf = _mean(self.confidences)
+    def finish(self, n_diagnosed: int) -> TriageCluster:
+        mean_conf = _mean(self.sum_confidence, self.n)
         dominant_action, dominant_n = (None, 0)
         if self.actions:
             # most_common ties arbitrarily; sort explicitly so the report is stable
@@ -443,23 +520,53 @@ class _Accum:
             headline_signal=self.signal,
             headline_source=self.source,
             headline_family=self.family,
-            n=n,
-            share=_rate(n, n_diagnosed),
+            n=self.n,
+            share=_rate(self.n, n_diagnosed),
+            share_denominator=n_diagnosed,
             mean_diagnostic_confidence=mean_conf,
-            mean_primary_probability=_mean(self.primaries),
-            mean_headline_logodds=_mean(self.logodds),
+            mean_primary_probability=_mean(self.sum_primary, self.n),
+            mean_headline_logodds=_mean(self.sum_logodds, self.n),
             dominant_action=dominant_action,
             dominant_action_n=dominant_n,
             action_counts=dict(sorted(self.actions.items())),
             fix_validated=self.fix_validated,
             fix_refuted=self.fix_refuted,
             fix_unknown=self.fix_unknown,
+            n_scored_interventions=self.n_scored_interventions,
             n_with_ground_truth=self.n_with_gt,
             n_non_rag=self.n_non_rag,
-            exemplar_ids=self.exemplars[:max_exemplars],
+            # Capped once, on the way in (see the class docstring); re-slicing here
+            # would be a second cap that hides the removal of the first.
+            exemplar_ids=list(self.exemplars),
             # RANKING CRITERION -- see triage()'s docstring for the justification.
-            priority_score=n * mean_conf,
+            priority_score=self.n * mean_conf,
         )
+
+
+def _rank_key(c: TriageCluster) -> tuple[int, float, int, float, str, str]:
+    """Total order over clusters that survives a non-finite score.
+
+    NaN loses every comparison it takes part in, so one NaN
+    ``mean_diagnostic_confidence`` (an infinite log-odds contribution from a
+    degenerate model is enough) made the sort a no-op for that cluster and handed the
+    ranking to the INPUT ORDER — while the call site's comment promised a fully
+    deterministic one, and ``to_dict`` then printed ``"rank": 1`` next to
+    ``"priority_score": null`` above a cluster scoring 0.9.
+
+    Non-finite scores sort LAST: a cluster whose score could not be computed has not
+    earned the top of a "fix this first" list. Within each group the same explicit
+    tie-breakers apply (size, confidence, then the cluster key) so the order is a
+    function of the clusters alone.
+    """
+    score, conf = c.priority_score, c.mean_diagnostic_confidence
+    return (
+        0 if math.isfinite(score) else 1,
+        -score if math.isfinite(score) else 0.0,
+        -c.n,
+        -conf if math.isfinite(conf) else 0.0,
+        c.dominant_mode.value,
+        c.headline_signal,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -519,6 +626,16 @@ def triage(
     no ground truth, and traces that raise are all handled. A raising trace is
     recorded in :attr:`TriageReport.failures` and the run continues;
     ``KeyboardInterrupt``/``SystemExit`` are deliberately *not* caught.
+
+    "Traces that raise" means anywhere in the per-trace path, not just inside
+    ``tt.analyze``: reading the report, picking the headline evidence line and folding
+    the trace into its cluster are equally able to raise on a malformed report (a
+    ``None`` diagnostic confidence, an evidence line with no family), and an earlier
+    version left all three outside the guard — so trace #2 of 3 took traces #1 and #3
+    down with it and recorded nothing in ``failures``, which is precisely what
+    :class:`TriageFailure` exists to prevent. **Producing** the traces counts too: an
+    ingest adapter that dies on line 4173 of a log is the same event as a trace that
+    fails to analyze, and everything read before it is kept.
     """
     threshold_origin = "explicit"
     if detection_threshold is None:
@@ -543,62 +660,103 @@ def triage(
     n_with_gt = 0
     run_tier: Optional[Tier] = None      # discovered from the reports, never assumed
 
-    for index, trace in enumerate(traces):
+    def _record(index: int, trace_id: Optional[str], exc: BaseException) -> None:
+        """Note one failed trace. The COUNT is never capped, only the detail list."""
+        if len(failures) < max_failures_recorded:
+            failures.append(TriageFailure(
+                index=index,
+                trace_id=trace_id,
+                error_type=type(exc).__name__,
+                error=str(exc)[:300],
+            ))
+
+    # Iterated by hand rather than with `for ... in enumerate(traces)` so that a
+    # raising ITERATOR is a recordable failure like any other. The traces are usually
+    # a generator reading a log file, and a decode error on one row used to escape
+    # triage() and discard every trace already analyzed.
+    stream = iter(traces)
+    index = -1
+    stream_broke = False
+    while True:
+        index += 1
+        try:
+            trace = next(stream)
+        except StopIteration:
+            break
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:  # noqa: BLE001 - a broken log must not lose the rest
+            # The input itself failed. Count it as a failed trace (it is one: a row we
+            # were meant to triage and could not) and stop — a generator that raised is
+            # closed, so pulling on it again would only raise StopIteration, and no
+            # iterator protocol promises recovery. Everything read so far is kept.
+            n_input += 1
+            n_failed += 1
+            _record(index, None, exc)
+            stream_broke = True
+            break
+
         n_input += 1
         try:
             # Only pass `tier` when the caller actually overrode it, so the minimal
             # contract a facade must satisfy stays `analyze(inference)`.
             report = tt.analyze(trace, tier=tier) if tier is not None else tt.analyze(trace)
+
+            # Everything below reads a report we did not build and may raise on a
+            # malformed one, so it lives INSIDE the guard. It also touches no shared
+            # counter: the bucket decision is computed here and committed after the
+            # guard, so a trace that dies mid-way cannot be half-counted (the one
+            # mutation here, `acc.add`, is itself atomic).
+            trace_tier = report.tier
+            trace_has_gt = int(bool(trace.has_ground_truth))
+            primary = None
+            acc: Optional[_Accum] = None
+            key: Optional[tuple[str, str]] = None
+            if report.abstained:
+                # Two very different reasons hide behind one flag; keep them apart.
+                # Below the detection threshold the engine's own note reads "appears
+                # healthy"; above it, the engine saw something and refused to rank it.
+                bucket = "healthy" if _top1(report) < detection_threshold else "declined"
+            elif report.primary is None:   # defensive: a report with no diagnoses at all
+                bucket = "declined"
+            else:
+                bucket = "diagnosed"
+                primary = report.primary
+                signal, source, family, logodds = _headline(report)
+                key = (primary.mode.value, signal)
+                acc = accums.get(key)
+                if acc is None:
+                    acc = _Accum(primary.mode, signal, source, family)
+                acc.add(trace, report, logodds,
+                        trace_key=trace.id if trace.id else f"#{index}",
+                        max_exemplars=max_exemplars)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except Exception as exc:  # noqa: BLE001 - one bad trace must not kill the run
             n_failed += 1
-            if len(failures) < max_failures_recorded:
-                failures.append(TriageFailure(
-                    index=index,
-                    trace_id=getattr(trace, "id", None),
-                    error_type=type(exc).__name__,
-                    error=str(exc)[:300],
-                ))
+            _record(index, getattr(trace, "id", None), exc)
             continue
 
+        # ---- commit: nothing below this line can raise ---- #
         n_analyzed += 1
-        n_with_gt += int(trace.has_ground_truth)
+        n_with_gt += trace_has_gt
         # The tier that RAN, not the tier requested. ModelHandle.with_tier only ever
         # down-caps (min(tier, profile.max_tier)) -- the documented auto-degrade
         # ladder -- so seeding this from the parameter let a fleet report claim
         # white-box causal evidence for a run that never left grey-box.
-        if report.tier is not None and (run_tier is None or report.tier < run_tier):
-            run_tier = report.tier
-
-        if report.abstained:
-            # Two very different reasons hide behind one flag; keep them apart. Below
-            # the detection threshold the engine's own note reads "appears healthy";
-            # above it, the engine saw something and refused to rank it.
-            if _top1(report) < detection_threshold:
-                n_healthy += 1
-            else:
-                n_abstained += 1
-            continue
-
-        primary = report.primary
-        if primary is None:            # defensive: a report with no diagnoses at all
+        if trace_tier is not None and (run_tier is None or trace_tier < run_tier):
+            run_tier = trace_tier
+        if bucket == "healthy":
+            n_healthy += 1
+        elif bucket == "declined":
             n_abstained += 1
-            continue
+        else:
+            n_diagnosed += 1
+            mode_counts[primary.mode] = mode_counts.get(primary.mode, 0) + 1
+            accums[key] = acc
 
-        n_diagnosed += 1
-        mode_counts[primary.mode] = mode_counts.get(primary.mode, 0) + 1
-        signal, source, family, logodds = _headline(report)
-        key = (primary.mode.value, signal)
-        acc = accums.get(key)
-        if acc is None:
-            acc = accums[key] = _Accum(primary.mode, signal, source, family)
-        acc.add(trace, report, logodds,
-                trace_key=trace.id if trace.id else f"#{index}",
-                max_exemplars=max_exemplars)
-
-    clusters = [a.finish(n_diagnosed, max_exemplars) for a in accums.values()]
-    # Fully deterministic order: score, then size, then confidence, then the key.
-    clusters.sort(key=lambda c: (-c.priority_score, -c.n, -c.mean_diagnostic_confidence,
-                                 c.dominant_mode.value, c.headline_signal))
+    clusters = [a.finish(n_diagnosed) for a in accums.values()]
+    clusters.sort(key=_rank_key)          # deterministic even with a NaN score
     for i, c in enumerate(clusters, start=1):
         c.rank = i
 
@@ -609,6 +767,7 @@ def triage(
         tier=run_tier, detection_threshold=float(detection_threshold),
         threshold_origin=threshold_origin,
         n_with_ground_truth=n_with_gt,
+        input_stream_failed=stream_broke,
     )
     out.notes = _notes(out)
     return out
@@ -623,6 +782,12 @@ def _notes(rep: TriageReport) -> list[str]:
             f"split at an assumed {rep.detection_threshold:.2f}. Those two buckets "
             f"({rep.n_healthy} healthy / {rep.n_abstained} declined) may not match the "
             f"engine's own classification.")
+    if rep.input_stream_failed:
+        # n_input is then a floor, not the size of the log, and every rate below is
+        # computed against it. Say so before any of them are read.
+        notes.append("The trace stream itself raised (an ingest adapter failing mid-log) "
+                     f"and iteration stopped there: the {rep.n_input} traces counted below "
+                     "are only those read before the break, not the whole input.")
     if rep.n_input == 0:
         notes.append("No traces supplied — nothing to triage.")
         return notes
@@ -633,6 +798,20 @@ def _notes(rep: TriageReport) -> list[str]:
     if rep.n_failed:
         notes.append(f"{rep.n_failed}/{rep.n_input} traces raised during analysis and are "
                      "excluded from every rate below (see `failures`).")
+    if rep.clusters and rep.n_diagnosed < rep.n_input:
+        # Fires on ANY gap, not only past some abstention threshold: a cluster share
+        # is misread as a share of the fleet at every ratio, and the reader has no way
+        # to notice the denominator is missing.
+        notes.append(f"Cluster `share` (%diag) is a fraction of the {rep.n_diagnosed} "
+                     f"DIAGNOSED traces, not of the {rep.n_input} supplied "
+                     f"({rep.n_healthy} healthy, {rep.n_abstained} declined, "
+                     f"{rep.n_failed} failed).")
+    non_finite = sum(1 for c in rep.clusters if not math.isfinite(c.priority_score))
+    if non_finite:
+        notes.append(f"{non_finite} cluster(s) had a non-finite priority score (a NaN or "
+                     "infinite mean, e.g. from a degenerate log-odds contribution). They "
+                     "are ranked LAST and serialize as null rather than being ordered by "
+                     "an unusable number.")
     if rep.n_diagnosed == 0:
         notes.append("No trace was diagnosed: every analyzed trace was healthy or "
                      "abstained. The mode distribution is empty, NOT all-zero.")
@@ -691,15 +870,22 @@ def render_text(rep: TriageReport, top: int = 10) -> str:
     if not rep.clusters:
         L.append("  (no clusters)")
     else:
+        # The column is `%diag`, never a bare `share`: the header has to carry its own
+        # denominator or the number is read as a share of the fleet, which overstates
+        # every cluster by the abstention rate.
+        L.append(f"  %diag = share of the {rep.n_diagnosed} DIAGNOSED traces "
+                 f"(of {rep.n_input} supplied); non-finite means print as n/a")
         # Column widths fit the longest real values (feature names reach 27 chars,
         # action keys 18) so the discriminating column is never truncated into
         # ambiguity — telling two clusters apart is the whole point of the table.
-        L.append(f"  {'#':>2s} {'n':>5s} {'share':>6s} {'conf':>5s} {'mode':18s} "
+        L.append(f"  {'#':>2s} {'n':>5s} {'%diag':>6s} {'conf':>5s} {'mode':18s} "
                  f"{'headline signal':27s} {'log-odds':>8s} {'action':18s} impact")
         for c in rep.top(top):
-            L.append(f"  {c.rank:2d} {c.n:5d} {c.share:6.1%} "
-                     f"{c.mean_diagnostic_confidence:5.2f} {c.dominant_mode.value:18.18s} "
-                     f"{c.headline_signal:27.27s} {c.mean_headline_logodds:+8.2f} "
+            L.append(f"  {c.rank:2d} {c.n:5d} {_num(c.share, '6.1%', 6)} "
+                     f"{_num(c.mean_diagnostic_confidence, '5.2f', 5)} "
+                     f"{c.dominant_mode.value:18.18s} "
+                     f"{c.headline_signal:27.27s} "
+                     f"{_num(c.mean_headline_logodds, '+8.2f', 8)} "
                      f"{(c.dominant_action or '-'):18.18s} {_impact_cell(c)}")
             L.append(f"     exemplars: {', '.join(c.exemplar_ids) or '-'}"
                      f"   (ground truth on {c.n_with_ground_truth}/{c.n})")
