@@ -97,6 +97,11 @@ class Calibrator:
         #: 0 exact per-signature map, 1 coarse ref/noref, 2 global, 3 raw sigmoid.
         #: Surfaced so a caller can tell the user a probability came from a pooled map.
         self.last_fallback: int = 0
+        #: Did the fitting data contain ANY reference-free record? If not, the
+        #: ``__global__`` pool is 100% reference-bearing, so serving it to a
+        #: reference-free trace is the very pooling this class exists to prevent —
+        #: see :meth:`transform`.
+        self.saw_noref: bool = False
 
     def fit(self, records: list[dict]) -> "Calibrator":
         """records: dicts with keys ``mode`` (FailureMode), ``signature`` (str),
@@ -112,6 +117,7 @@ class Calibrator:
             # pooled map — the pooling this module exists to avoid.
             groups[(mode, _coarse(sig))].append((r["z"], int(r["label"])))
             groups[(mode, "__global__")].append((r["z"], int(r["label"])))
+            self.saw_noref = self.saw_noref or sig.endswith("|noref")
 
         for key, pairs in groups.items():
             if len(pairs) < self.min_samples:
@@ -174,8 +180,18 @@ class Calibrator:
 
     def transform(self, mode: FailureMode, signature: str, z: float) -> float:
         mkey = mode.value if isinstance(mode, FailureMode) else str(mode)
-        for level, key in enumerate(((mkey, signature), (mkey, _coarse(signature)),
-                                     (mkey, "__global__"))):
+        ladder = [(mkey, signature), (mkey, _coarse(signature))]
+        # The __global__ rung is only admissible if the pool it was fitted from
+        # actually contains records like this trace. A calibrator trained on
+        # reference-bearing data alone has a __global__ that IS the reference-bearing
+        # map under another name, so offering it to a reference-free trace defeats
+        # the |noref guard one rung below where _coarse() blocks it — measured as
+        # 326/412 production-shape probabilities served by a pooled reference-bearing
+        # map, ECE 0.0053 -> 0.0691. Falling through to the raw sigmoid is the honest
+        # outcome: no map fits this trace, so do not pretend one does.
+        if self.saw_noref or not signature.endswith("|noref"):
+            ladder.append((mkey, "__global__"))
+        for level, key in enumerate(ladder):
             m = self.maps.get(key)
             if m is not None:
                 self.last_fallback = level      # 0 = exact map, >0 = pooled

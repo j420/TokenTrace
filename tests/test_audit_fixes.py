@@ -300,3 +300,54 @@ def test_every_backend_defaults_to_cpu():
     for cls in (HFModel, NNsightModel, ModelScorers):
         default = inspect.signature(cls.__init__).parameters["device"].default
         assert default == "cpu", f"{cls.__name__} defaults to device={default!r}"
+
+
+# --------------------------------------------------------------------------- #
+# Reference-free traces must never be served a reference-bearing calibration map.
+def _cal_records(signature: str, n: int = 200):
+    """Separable (z, label) records under one missingness signature."""
+    from tokentrace.core.types import FailureMode
+
+    return [{"mode": FailureMode.HALLUCINATION, "signature": signature,
+             "z": (3.0 if i % 2 else -3.0), "label": i % 2} for i in range(n)]
+
+
+def test_noref_trace_is_not_served_a_reference_only_pooled_map():
+    """The ``|noref`` signature exists so a production trace never reuses a map
+    fitted on reference-bearing data. ``_coarse()`` blocks the ``__ref__`` rung,
+    but ``__global__`` sits one below it and, when training saw no reference-free
+    records, IS the reference-bearing pool under another name — so the guard used
+    to be defeated one rung down (326/412 production probabilities served this way).
+    """
+    from tokentrace.core.types import FailureMode
+    from tokentrace.engine.calibration import Calibrator
+
+    cal = Calibrator().fit(_cal_records("confidence+prompt+retrieval"))
+    assert cal.is_fitted and not cal.saw_noref
+    assert ("hallucination", "__global__") in cal.maps, "precondition: a global map exists"
+
+    cal.transform(FailureMode.HALLUCINATION, "confidence+prompt+retrieval", 1.0)
+    assert cal.last_fallback < 3, "a reference-bearing trace SHOULD still be calibrated"
+
+    cal.transform(FailureMode.HALLUCINATION, "confidence+prompt+retrieval|noref", 1.0)
+    assert cal.last_fallback == 3, (
+        "a reference-free trace was served a pooled map fitted only on "
+        "reference-bearing records; it must fall through to the raw sigmoid")
+
+
+def test_noref_trace_may_use_the_global_map_once_noref_data_was_fitted():
+    """The guard is about provenance, not about refusing calibration forever: once
+    the pool actually contains reference-free records, the global rung is admissible
+    again. Without this, the fix above would be indistinguishable from 'never
+    calibrate a noref trace'."""
+    from tokentrace.core.types import FailureMode
+    from tokentrace.engine.calibration import Calibrator
+
+    mixed = _cal_records("confidence+prompt+retrieval") + \
+        _cal_records("confidence+prompt|noref")
+    cal = Calibrator().fit(mixed)
+    assert cal.saw_noref
+
+    # A signature with no map of its own, but the pool now contains noref records.
+    cal.transform(FailureMode.HALLUCINATION, "prompt+retrieval|noref", 1.0)
+    assert cal.last_fallback < 3, "global rung should be admissible once noref was fitted"

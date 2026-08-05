@@ -172,6 +172,86 @@ which is the intended "less certain under noisier evidence" behaviour, but the e
 is small. An earlier revision presented this sweep as demonstrating graceful
 degradation; it does not.
 
+## 4.5 The no-reference (production) split — the most consequential result here
+
+Everything above is measured on traces carrying **ground truth AND gold-chunk
+flags**. Production traces carry neither. Until this section existed, the operating
+mode the product will actually run in had never been measured at all.
+
+`tokentrace/eval/noref.py` strips both (labels survive: they come from the injection
+recipes, not from the reference) and reports two experiments, because they answer
+different questions.
+
+| | baseline (reference-bearing) | **(a) transfer** | (b) retrained on stripped |
+|---|---|---|---|
+| diagnosis accuracy | 0.977 | **0.593** (−0.384) | 0.977 (±0.000) |
+| Top-3 accuracy | 0.977 | **0.954** | 0.977 |
+| conformal coverage / set size | 1.000 / 1.27 | 0.918 / 1.37 | 0.973 / 1.30 |
+| declined rate | 0.000 | **0.274** | 0.027 |
+| debugging-time↓ | 0.635 | 0.194 | 0.583 |
+| mean root rank | 1.06 | 2.33 | 1.21 |
+| recommendation precision | 0.787 | `UNAVAILABLE(no_ground_truth)` | `UNAVAILABLE` |
+
+**(a) transfer** — train and calibrate exactly as shipped, then evaluate on stripped
+traces. This is the real production scenario and the headline number: **0.977 → 0.593**.
+**(b) retrained** — train on stripped data too: the ceiling if you accept you will
+never have references. It fully recovers.
+
+Per-mode F1 shows precisely what breaks:
+
+| mode | baseline | (a) transfer | (b) retrained | support |
+|---|---|---|---|---|
+| prompt_ambiguity | 1.00 | 1.00 | 1.00 | 12 |
+| **retrieval_failure** | 1.00 | **0.00** | 1.00 | 26 |
+| **context_dilution** | 1.00 | **0.20** | 1.00 | 9 |
+| hallucination | 1.00 | 0.97 | 0.97 | 34 |
+| reasoning_failure | 0.75 | 0.75 | 0.80 | 6 |
+
+Three things make this more than a bad number:
+
+- **It fails safe, not loud.** Precision stays 1.000 wherever a prediction is made;
+  what rises is silence (`declined` 0.000 → 0.274). The engine stops being able to
+  *rank* the cause first, not to find it — Top-3 only falls 0.977 → 0.954.
+- **The predicted retrieval-vs-dilution collapse did NOT happen.** Zero cross-confusions
+  in either direction. They collapse *separately*: retrieval failure into abstention (13)
+  and into its own labelled sequela hallucination (12); dilution into abstention (7).
+  `ret.gold_absent` and `dil.present_wrong` both require `gold_recall_in_context`, so
+  they abstain *together* and neither mode receives evidence to win on. The honest
+  statement is sharper than the prediction: **without a reference the engine still sees
+  that something is wrong, but not what caused it.**
+- **The drop decomposes cleanly**, via two half-strips that separate a real production
+  loss from a mock artifact (`MockModel._decide` reads `Chunk.gold` as its own oracle,
+  which no real model ever sees):
+
+  | control | diagnosis |
+  |---|---|
+  | annotations removed, reference kept (**the mock artifact alone**) | **0.977** — costs nothing |
+  | reference removed, annotations kept | 0.674 |
+  | both removed (= transfer) | 0.593 |
+
+  So 0.977 → 0.674 is losing the *reference* (it kills retrieval_failure), and
+  0.674 → 0.593 is additionally losing the gold annotation, which takes
+  `gold_position_frac` and `dil.buried` with it. Both are genuine production losses.
+
+**A calibration bug this experiment found.** Stripped traces do select `|noref`
+signatures, but a shipped calibrator has no `|noref` map — `train_engine` builds
+calibration records only from reference-bearing data. `_coarse()` blocks the `__ref__`
+rung, but `__global__` sits one below and *is* the reference-bearing pool under another
+name, so **326 of 412** production-shape probabilities were served by it (ECE
+0.0053 → 0.0691). Fixed: the `__global__` rung is now admissible only if the pool
+contains records like the trace being scored. Refusing it costs transfer ECE
+0.0691 → 0.0749 and Top-3 0.977 → 0.954 — reported rather than buried, since that map
+did happen to help here. It was adopted on the strength of beating raw sigmoid on
+*reference-bearing* held-out data and was never validated on reference-free traces.
+
+**Caveats.** (b)'s ceiling is optimistic for `context_dilution`: its surviving
+reference-free separators include `context_length_tokens`, which is the §2.1 shape
+shortcut. `retrieval_failure`'s recovery is clean (`max_chunk_relevance` 0.14 vs 0.51,
+`answer_supported_by_context` 0.08 vs 1.00 separate it with no reference at all). And
+this is **not** "you can evaluate in production" — labels survive stripping only
+because the injection recipes supply them; in production you have neither the
+reference nor the label. Small split (86 rows, 9 dilution).
+
 ## 5. Findings
 
 1. The interpretable rules are strong alone (0.814) and the learned residual closes
@@ -183,6 +263,11 @@ degradation; it does not.
 4. Recommendations are validated by simulated intervention and genuinely fail 21% of
    the time, so the ≥0.75 target is met on a metric that *can* fail.
 5. The observability tiers are **not** distinguished by this benchmark.
+6. **Every other number in this document is measured on traces carrying a ground-truth
+   reference, which production traces do not have.** On production-shape traces the
+   shipped engine drops to **0.593** (§4.5). It fails safe — precision holds, silence
+   rises — and retraining reference-free recovers it fully, but the headline figures
+   above should not be read as production performance.
 
 ## 6. Threats to validity
 
@@ -200,6 +285,9 @@ degradation; it does not.
   executed (HuggingFace is unreachable in this environment). They were audited and
   substantially corrected — the nnsight capture path could not complete at all, and
   gguf would have reserved ~5 GB — but first-real-run verification is still pending.
+- **Reference dependence.** The headline table assumes a ground-truth reference. §4.5
+  measures what happens without one: 0.977 → 0.593. This is the single largest gap
+  between these results and deployed behaviour.
 - **Small test split** (86 rows): differences under ~0.05 are not meaningful.
 
 ## 7. Next steps
