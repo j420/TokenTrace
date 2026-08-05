@@ -209,9 +209,17 @@ Per-mode F1 shows precisely what breaks:
 
 Three things make this more than a bad number:
 
-- **It fails safe, not loud.** Precision stays 1.000 wherever a prediction is made;
-  what rises is silence (`declined` 0.000 → 0.274). The engine stops being able to
-  *rank* the cause first, not to find it — Top-3 only falls 0.977 → 0.954.
+- **It mostly fails quiet, but not entirely.** What rises is silence — `declined`
+  0.000 → 0.274 — and Top-3 barely moves (0.977 → 0.954), so the true root stays in
+  the differential; the engine loses the ability to *rank* it first, not to find it.
+  But **precision does fall**: of the 55 traces still given a primary root, 40 are
+  right — **0.727**, against 0.973 at baseline. 12 retrieval failures are named as
+  *hallucination* (a true co-label, but the sequela rather than the root, so the fix
+  offered is `ground_or_abstain` where `add_gold_context` was needed), 1 as reasoning
+  failure, and 2 clean rows are called reasoning failures. An earlier revision of this
+  section claimed "precision stays 1.000 wherever a prediction is made". That was
+  false, and the per-mode table two rows up already contradicted it
+  (`reasoning_failure` P=0.600 in every condition).
 - **The predicted retrieval-vs-dilution collapse did NOT happen.** Zero cross-confusions
   in either direction. They collapse *separately*: retrieval failure into abstention (13)
   and into its own labelled sequela hallucination (12); dilution into abstention (7).
@@ -225,24 +233,60 @@ Three things make this more than a bad number:
 
   | control | diagnosis |
   |---|---|
-  | annotations removed, reference kept (**the mock artifact alone**) | **0.977** — costs nothing |
-  | reference removed, annotations kept | 0.674 |
+  | annotations removed, reference kept | 0.977 |
+  | reference removed, annotations kept | **0.674** |
   | both removed (= transfer) | 0.593 |
 
-  So 0.977 → 0.674 is losing the *reference* (it kills retrieval_failure), and
-  0.674 → 0.593 is additionally losing the gold annotation, which takes
-  `gold_position_frac` and `dil.buried` with it. Both are genuine production losses.
+  **Read 0.674, not 0.593, as the honest transfer figure.** An earlier revision of
+  this section read the table additively and called both steps "genuine production
+  losses". That was wrong. `MockModel._decide` reads `Chunk.gold` as its own oracle,
+  so deleting the annotation changes what the *simulated model does* — something no
+  real model can experience, since a real model never sees your eval metadata.
+  Re-running the strip with the mock's decision frozen to what it chose on the
+  reference-bearing original recovers the entire 0.674 → 0.593 step: diagnosis
+  returns to 0.674, `declined` to 0.178, and the dilution collapse (F1 1.00 → 0.20)
+  disappears completely. The artifact accounts for all 9 re-decided rows, every one
+  of them `context_dilution`.
+
+  Note also that the top row cannot serve as the artifact's control: keeping the
+  reference means `dil.present_wrong` still fires and re-diagnoses the re-decided
+  rows, so it *masks* the artifact rather than isolating it. The artifact is present
+  in that condition too — the same 9 rows re-decide — it just costs nothing there.
+  The three numbers are therefore **not additive**.
+
+  **`retrieval_failure`'s collapse is genuine and survives the control unchanged**
+  (F1 0.00; 13 → abstain, 12 → hallucination, 1 → reasoning failure). That is the
+  real finding. The dilution collapse is not.
 
 **A calibration bug this experiment found.** Stripped traces do select `|noref`
 signatures, but a shipped calibrator has no `|noref` map — `train_engine` builds
 calibration records only from reference-bearing data. `_coarse()` blocks the `__ref__`
 rung, but `__global__` sits one below and *is* the reference-bearing pool under another
 name, so **326 of 412** production-shape probabilities were served by it (ECE
-0.0053 → 0.0691). Fixed: the `__global__` rung is now admissible only if the pool
-contains records like the trace being scored. Refusing it costs transfer ECE
-0.0691 → 0.0749 and Top-3 0.977 → 0.954 — reported rather than buried, since that map
-did happen to help here. It was adopted on the strength of beating raw sigmoid on
-*reference-bearing* held-out data and was never validated on reference-free traces.
+0.0053 → 0.0691). Fixed: the `__global__` rung is admissible only if the pool contains
+*enough* reference-free records to have shaped it — a presence test was not enough,
+since 400 reference-bearing records plus one reference-free one produced a
+99.75%-reference-bearing pool that a presence test happily served, restoring the bug.
+
+**The guard's full cost, since a partial disclosure is its own kind of burying.** It
+moves at least eight metrics on the transfer condition, not the two first reported:
+
+  | transfer metric | before guard | after guard |
+  |---|---|---|
+  | ECE (calibrated) | 0.0691 | 0.0749 |
+  | Top-3 | 0.977 | 0.954 |
+  | conformal coverage | 0.973 | **0.918** |
+  | conformal set size | 1.534 | 1.370 |
+  | context_dilution F1 | 0.364 | **0.200** |
+  | debugging-time↓ | 0.209 | 0.194 |
+  | mean root rank | 2.288 | 2.329 |
+
+  Two of these appear in the tables above attributed to losing the reference: the
+  0.918 coverage is 0.027 reference-loss and 0.055 *guard*, and the dilution F1 of
+  0.20 was 0.36 before it. The guard is still right — the map was adopted for beating
+  raw sigmoid on *reference-bearing* held-out data and was never validated on
+  reference-free traces — but it is not cheap, and the better fix remains fitting real
+  `|noref` maps rather than refusing the pooled one.
 
 **Caveats.** (b)'s ceiling is optimistic for `context_dilution`: its surviving
 reference-free separators include `context_length_tokens`, which is the §2.1 shape

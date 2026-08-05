@@ -68,6 +68,7 @@ from tokentrace.core.types import Chunk, Inference
 from tokentrace.ingest.base import (
     ChunkBuilder,
     content_text,
+    defers_to_structured_retrieval,
     find_reference,
     first_present,
     first_text,
@@ -154,6 +155,13 @@ def _split_block(body: str, builder: ChunkBuilder, prefix: str) -> str:
     markers = list(_ENTRY_MARKER.finditer(body))
     if markers:
         bounds = [m.start() for m in markers] + [len(body)]
+        # Text BEFORE the first marker is retrieved context too, and dropping it is
+        # not a harmless omission: the layout "Context:\n<lead-in sentence>\n- fact"
+        # is ordinary, and if the answer lives in that lead-in the engine sees a
+        # confident gold_recall_in_context = 0.0 — a measured zero, not a missing
+        # value — and reports a retrieval failure for a trace where retrieval
+        # actually worked. Fabricating evidence is worse than losing it.
+        builder.add(body[: markers[0].start()], source_id=f"{prefix}pre")
         for i, match in enumerate(markers):
             text = body[match.end() : bounds[i + 1]]
             builder.add(text, source_id=_marker_id(match) or f"{prefix}{i}")
@@ -219,7 +227,6 @@ _COMPLETION_PATHS = (
     "response.choices[0].text",
     "choices[0].text",
     "response.content",            # Anthropic: [{"type": "text", "text": ...}]
-    "content",
     "response.output_text",
     "output_text",
     "response.output[0].content",  # OpenAI Responses API
@@ -227,6 +234,12 @@ _COMPLETION_PATHS = (
     "completion",
     "response.completion",
     "generated_answer",
+    # LAST, and deliberately so. A bare top-level `content` is the most ambiguous
+    # key here — it is just as likely to be an article body or a template as a
+    # completion. Ranked above the explicit keys it silently beat
+    # `generated_answer`, putting the wrong string in the answer field and
+    # computing every correctness and confidence signal against it.
+    "content",
 )
 _MODEL_PATHS = ("model", "request.model", "response.model", "body.model")
 _ID_PATHS = ("id", "response.id", "request_id", "trace_id", "run_id")
@@ -271,9 +284,13 @@ def detect(payload: Any) -> bool:
         return False
     if any(str(k).startswith("gen_ai.") for k in payload):
         return False
-    for foreign in ("source_documents", "source_nodes", "page_content", "tokentrace_field_map"):
-        if foreign in payload:
-            return False
+    if "tokentrace_field_map" in payload:
+        return False
+    # Shared list rather than a hand-kept one: this deferral previously named only
+    # 3 of the 6 document keys langchain reads, so `messages` + `documents` was
+    # claimed here and the scored, gold-annotated documents were thrown away.
+    if defers_to_structured_retrieval(payload):
+        return False
     if isinstance(payload.get("attributes"), (Mapping, list)):
         return False  # an OTel-style span, not a chat log
     messages = _messages(payload)
