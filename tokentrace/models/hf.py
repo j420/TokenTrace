@@ -3,7 +3,9 @@
 Grey-box (single forward pass, no GPU needed):
   * attention-to-context / attention-to-gold from ``output_attentions``
   * logit-lens answer-formation depth from ``output_hidden_states``
-  * ReDeEP-lite external-context vs parametric-knowledge scores
+  * ReDeEP-lite external-context vs parametric-knowledge scores — two DISTINCT
+    measurements (see :meth:`HFModel._external_copy_score` and
+    :meth:`HFModel._parametric_share` for exactly what each one reads)
 
 White-box (a few extra forward passes):
   * ``gold_patch_effect`` — causal effect of the gold-chunk tokens on the answer
@@ -28,10 +30,13 @@ Confidence semantics: :meth:`HFModel.confidence` teacher-forces the *given*
 answer instead of re-generating (the base-class default would describe a
 different string than the one being diagnosed).
 
-All heavy imports are lazy. This backend is the fallback ladder's rung above
-NNsight/TransformerLens: it uses only ``transformers`` forward hooks
-(``output_attentions``/``output_hidden_states``), so it works on any HF model —
-including ones TransformerLens does not yet support.
+All heavy imports are lazy. Backends are selected explicitly via
+``registry.load_model(backend=...)`` — there is no automatic backend-to-backend
+fallback. This is the default capture backend: it uses only ``transformers``
+built-ins (``output_attentions``/``output_hidden_states`` plus read-only forward
+hooks), so it works on any HF causal LM; ``models/nnsight.py`` sits beside it for
+intervention-style (activation-patching) capture. The only automatic degradation
+is the TIER ladder (white -> grey -> black) driven by ``ModelProfile.max_tier``.
 """
 
 from __future__ import annotations
@@ -79,9 +84,23 @@ class HFModel(ModelHandle):
 
         repo = hf_repo or profile.hf_repo or profile.name
         self.tokenizer = AutoTokenizer.from_pretrained(repo)
+        # transformers renamed `torch_dtype` -> `dtype` in 4.56 and 5.x warns on
+        # the old name; below 4.56 the NEW name is silently swallowed into the
+        # config (fp32 weights, no error), so this must be a version check, not
+        # try/except. Parsed leniently: "5.0.0.dev0"-style suffixes are ignored.
+        dtype_kw = "torch_dtype"
+        try:
+            import transformers
+
+            _v = tuple(int("".join(ch for ch in p if ch.isdigit()) or 0)
+                       for p in transformers.__version__.split(".")[:2])
+            if _v >= (4, 56):
+                dtype_kw = "dtype"
+        except Exception:  # pragma: no cover - unparseable version string
+            pass
+        model_kwargs.setdefault(dtype_kw, getattr(torch, dtype, torch.float32))
         self.model = AutoModelForCausalLM.from_pretrained(
             repo,
-            torch_dtype=getattr(torch, dtype, torch.float32),
             attn_implementation="eager",  # needed to read attention weights
             **model_kwargs,
         ).to(device).eval()
@@ -293,10 +312,20 @@ class HFModel(ModelHandle):
         enc = {k: v.to(self.device) for k, v in enc.items()}
         enc_with_off = {**enc, "offset_mapping": offset}
 
-        with torch.no_grad():
-            # keep_logits=1: capture reads hidden states + attentions only.
-            out = self._forward(enc, keep_logits=1,
-                                output_attentions=True, output_hidden_states=True)
+        # Read-only taps on each decoder layer + its FFN sublayer, so the SAME
+        # forward pass also yields the per-layer FFN residual contributions the
+        # parametric score needs (output_hidden_states alone cannot separate a
+        # layer's attention-sublayer update from its FFN-sublayer update).
+        taps = self._register_parametric_taps()
+        try:
+            with torch.no_grad():
+                # keep_logits=1: capture reads hidden states + attentions only.
+                out = self._forward(enc, keep_logits=1,
+                                    output_attentions=True, output_hidden_states=True)
+        finally:
+            if taps is not None:
+                for handle in taps["handles"]:
+                    handle.remove()
         attentions = out.attentions          # tuple[L] of [1, H, S, S]
         hidden = out.hidden_states           # tuple[L+1] of [1, S, D]
         seq_len = attentions[0].shape[-1]
@@ -314,17 +343,15 @@ class HFModel(ModelHandle):
         # --- logit lens: depth at which the final answer token stabilizes --- #
         answer_layer, stability = self._logit_lens(hidden, last)
 
-        # ReDeEP-lite: external = context attention (heads reading context);
-        # parametric = how early/strongly the answer forms without context support.
-        # KNOWN LIMITATION (documented, not fixed here): `parametric` is a
-        # deterministic function of `external`, so a rule that treats "low external
-        # AND high parametric" as two corroborating signals is reading one
-        # measurement twice. A true ReDeEP parametric score needs the FFN/MLP
-        # contribution to the answer logit; changing the scale here would desync
-        # the calibrator, which is fit on the mock's independent values.
-        external = attn_to
-        parametric = max(0.0, 1.0 - external) * (1.0 - (answer_layer or 0.5)) * 2
-        parametric = min(1.0, parametric)
+        # --- ReDeEP-lite: two DECOUPLED anchors (Sun et al., ICLR 2025) --- #
+        # external: attention-weighted copying from context toward the emitted
+        # token (mass x content alignment) — NOT the raw attention mass, so it is
+        # not an alias of context_attention_ratio.
+        # parametric: share of the emitted token's logit-lens promotion done by
+        # FFN sublayers rather than attention sublayers — measured from the
+        # residual-stream decomposition, independent of context attention.
+        external = self._external_copy_score(attentions, hidden[-1][0], last, ctx_pos, heads)
+        parametric = self._parametric_share(hidden, taps, last)
 
         result = CaptureResult(
             n_layers=len(attentions),
@@ -333,7 +360,7 @@ class HFModel(ModelHandle):
             logit_lens_answer_layer=answer_layer,
             logit_lens_stability=stability,
             external_context_score=round(external, 3),
-            parametric_knowledge_score=round(parametric, 3),
+            parametric_knowledge_score=round(parametric, 3) if parametric is not None else None,
         )
 
         if self.supports(Tier.WHITE) and gold_pos:
@@ -356,6 +383,197 @@ class HFModel(ModelHandle):
             mass = row[:, to_positions].sum(dim=-1) / row.sum(dim=-1).clamp_min(1e-9)
             vals.append(float(mass.mean()))
         return float(sum(vals) / len(vals)) if vals else 0.0
+
+    # ------------------------------------------------------------------ #
+    # ReDeEP-lite: decoupled external-context / parametric-knowledge scores
+    # ------------------------------------------------------------------ #
+    #: Where the decoder-layer list lives across architectures (same set the
+    #: NNsight backend probes).
+    _LAYER_PATHS = ("model.layers", "model.language_model.layers",
+                    "model.decoder.layers", "transformer.h", "gpt_neox.layers")
+    #: The module whose OUTPUT is the FFN contribution added to the residual
+    #: stream. Gemma-2/3 style layers norm the MLP output before adding it
+    #: (``post_feedforward_layernorm``), so that norm must be tapped there —
+    #: tapping ``mlp`` would decompose the residual stream incorrectly.
+    _FFN_TAP_ATTRS = ("post_feedforward_layernorm", "mlp", "feed_forward")
+
+    def _find_layers(self):
+        """The decoder-layer ModuleList, or None if this architecture hides it
+        somewhere we don't know about (then the parametric score abstains)."""
+        for path in self._LAYER_PATHS:
+            obj = self.model
+            for part in path.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            try:
+                if obj is not None and len(list(obj)) > 0:
+                    return list(obj)
+            except TypeError:        # resolved to a non-iterable module
+                continue
+        return None
+
+    @staticmethod
+    def _as_hidden(output):
+        """A decoder layer returns ``(hidden, ...)`` on transformers < 4.54 and a
+        bare tensor on >= 4.54; normalise to the hidden-state tensor."""
+        return output[0] if isinstance(output, (tuple, list)) else output
+
+    def _register_parametric_taps(self):
+        """Register read-only forward hooks capturing, at every decoder layer,
+        the layer's output residual and its FFN sublayer's residual contribution
+        (both at the final position). Returns ``{"handles", "layer_out",
+        "ffn_out", "calls"}`` or None when the architecture can't be tapped —
+        the parametric score then abstains rather than guessing.
+        """
+        layers = self._find_layers()
+        if layers is None:
+            return None
+        ffn_mods = []
+        for layer in layers:
+            tap = next((getattr(layer, a) for a in self._FFN_TAP_ATTRS
+                        if getattr(layer, a, None) is not None), None)
+            if tap is None or not callable(tap):
+                return None          # e.g. OPT keeps fc1/fc2 loose on the layer
+            ffn_mods.append(tap)
+
+        n = len(layers)
+        taps = {"handles": [], "layer_out": [None] * n, "ffn_out": [None] * n,
+                "calls": [0] * n}
+
+        def _mk(store, idx, unwrap):
+            def hook(_module, _args, output):
+                h = unwrap(output)
+                store[idx] = h[0, -1, :].detach()
+                if store is taps["ffn_out"]:
+                    taps["calls"][idx] += 1
+            return hook
+
+        for i, (layer, ffn) in enumerate(zip(layers, ffn_mods)):
+            taps["handles"].append(
+                layer.register_forward_hook(_mk(taps["layer_out"], i, self._as_hidden)))
+            taps["handles"].append(
+                ffn.register_forward_hook(_mk(taps["ffn_out"], i, lambda o: o)))
+        return taps
+
+    @staticmethod
+    def _external_copy_score(attentions, content, last, ctx_pos, heads) -> float:
+        """External Context Score (ReDeEP-lite): attention-weighted copying from
+        the retrieved context toward the emitted token.
+
+        ``content`` is the [S, D] matrix of final-layer (post-final-norm) hidden
+        states. Per layer: (attention mass on context positions from the
+        answer-forming position) x (cosine alignment, mapped to [0,1], between
+        the attention-weighted pooling of the context tokens' final-layer hidden
+        states and the final-layer hidden state that produces the emitted
+        token), averaged over layers; ``heads`` restricts to catalogued
+        retrieval/copying heads when the profile has them. This follows ReDeEP's
+        ECS (cosine between the pooled last-layer states of attended context
+        tokens and the generating token's state), with attended-token pooling by
+        attention weight instead of the paper's top-k selection. Unlike
+        ``context_attention_ratio`` (pure mass), this is low when the model
+        reads the context but emits something else — the two are distinct
+        measurements, not aliases. (Also called by the NNsight backend.)
+        """
+        import torch
+
+        if not ctx_pos:
+            return 0.0
+        content = content.float()            # final-layer states = token content
+        emit = content[last]                 # the state that produces the answer
+        vals = []
+        for layer_idx, att in enumerate(attentions):
+            row = att[0, :, last, :]         # [H, S]
+            if heads:
+                sel = [h for (l, h) in heads if l == layer_idx]
+                if not sel:
+                    continue
+                row = row[sel]
+            a = row.float().mean(dim=0)      # head-averaged attention [S]
+            ctx_w = a[ctx_pos]
+            ctx_sum = float(ctx_w.sum())
+            if ctx_sum <= 0.0:
+                vals.append(0.0)
+                continue
+            mass = ctx_sum / float(a.sum().clamp_min(1e-9))
+            pooled = (ctx_w.unsqueeze(-1) * content[ctx_pos]).sum(dim=0) / ctx_sum
+            cos = float(torch.nn.functional.cosine_similarity(pooled, emit, dim=0))
+            vals.append(mass * (cos + 1.0) / 2.0)
+        return float(sum(vals) / len(vals)) if vals else 0.0
+
+    def _parametric_share(self, hidden, taps, last) -> Optional[float]:
+        """Parametric Knowledge Score (ReDeEP-lite): the share of the emitted
+        token's logit-lens promotion contributed by FFN sublayers.
+
+        Decomposes each layer's residual update at the answer-forming position
+        into its attention part and its FFN part (``x_mid = x_out - ffn_out``,
+        exact for pre-norm residual architectures incl. parallel-sublayer ones;
+        Gemma-style post-FFN norms are tapped after the norm so the identity
+        still holds), reads the emitted token's log-prob through the final-norm
+        logit lens at ``x_in``/``x_mid``/``x_out``, and returns
+
+            sum_l max(0, ffn_gain_l) / (sum_l max(0, attn_gain_l) + sum_l max(0, ffn_gain_l))
+
+        in [0, 1]: 1 = the answer's probability was promoted entirely by FFNs
+        (parametric memory, per ReDeEP's "Knowledge FFNs over-add parametric
+        knowledge"), 0 = entirely by attention moving information in. This is the
+        bounded, regression-free stand-in for ReDeEP's per-FFN logit-lens
+        divergence, computed for the emitted token only; it shares NO term with
+        the external score. Returns None (feature missing, handled by the
+        missingness mask) when the architecture could not be tapped or the
+        emitted token was never promoted.
+        """
+        import torch
+
+        if taps is None or any(c != 1 for c in taps["calls"]) \
+                or any(v is None for v in taps["layer_out"]) \
+                or any(v is None for v in taps["ffn_out"]):
+            return None
+        try:
+            lm_head = self.model.get_output_embeddings()
+        except Exception:
+            return None
+        norm = self._find_final_norm()
+        if lm_head is None or norm is None:
+            return None
+
+        n = len(taps["layer_out"])
+        # hidden[l] is the (pre-norm) residual ENTERING layer l; the tapped
+        # layer_out[l] is the (pre-norm) residual LEAVING it — used instead of
+        # hidden[l+1] because hidden[-1] is already final-normed.
+        x_in = [hidden[l][0, last] for l in range(n)]
+        x_out = list(taps["layer_out"])
+        x_mid = [o - f for o, f in zip(x_out, taps["ffn_out"])]
+        stacked = torch.stack(x_in + x_mid + x_out)          # [3n, D] pre-norm
+        with torch.no_grad():
+            logits = lm_head(norm(stacked)).float()
+            # Emitted token = argmax of the true final distribution (same
+            # reference _logit_lens uses: hidden[-1] feeds lm_head directly).
+            answer_tok = int(lm_head(hidden[-1][0, last]).float().argmax())
+            lp = torch.log_softmax(logits, dim=-1)[:, answer_tok]
+        lp_in, lp_mid, lp_out = lp[:n], lp[n:2 * n], lp[2 * n:]
+        return self._ffn_share([float(v) for v in lp_in], [float(v) for v in lp_mid],
+                               [float(v) for v in lp_out])
+
+    @staticmethod
+    def _ffn_share(lp_in, lp_mid, lp_out) -> Optional[float]:
+        """The parametric-share formula on per-layer emitted-token log-probs.
+
+        ``lp_in[l]`` / ``lp_mid[l]`` / ``lp_out[l]``: log-prob of the emitted
+        token through the final-norm logit lens at layer ``l``'s input residual,
+        post-attention residual, and post-FFN residual. An ``lp_in`` entry may be
+        None (backend could not read that layer's input, e.g. NNsight without a
+        resolvable embedding module for layer 0) — that layer's attention gain is
+        then skipped. Returns None when the emitted token was never promoted.
+        (Shared by the HF and NNsight backends so the score means the same thing
+        on both.)
+        """
+        attn_gain = sum(max(0.0, m - i) for i, m in zip(lp_in, lp_mid) if i is not None)
+        ffn_gain = sum(max(0.0, o - m) for m, o in zip(lp_mid, lp_out))
+        total = attn_gain + ffn_gain
+        if total <= 1e-9:
+            return None
+        return ffn_gain / total
 
     def _find_final_norm(self):
         """The final pre-``lm_head`` norm, or None if this architecture hides it
@@ -414,7 +632,7 @@ class HFModel(ModelHandle):
         stability = matches / n
         return round(answer_layer, 3), round(stability, 3)
 
-    def _gold_ablation_effect(self, inference: Inference) -> float:
+    def _gold_ablation_effect(self, inference: Inference) -> Optional[float]:
         """Causal test: answer-logit(full) - answer-logit(gold removed).
 
         Large positive => the answer causally depends on the gold context (grounded).
@@ -430,8 +648,16 @@ class HFModel(ModelHandle):
             return 0.0
         target = target[0]
 
-        def answer_logit(prompt: str) -> float:
+        def answer_logit(prompt: str) -> Optional[float]:
             enc = self._encode(prompt)
+            # A transformer cannot run a zero-length forward pass — it dies deep in
+            # a tensor reshape. The ablated prompt IS empty whenever the gold chunk
+            # was the entire prompt (a one-chunk RAG trace with no question text
+            # survives ablation as ""), so the causal contrast is undefined there,
+            # not zero: "we could not measure it" and "ablating gold changed
+            # nothing" are opposite conclusions about groundedness.
+            if enc["input_ids"].numel() == 0:
+                return None
             enc = {k: v.to(self.device) for k, v in enc.items()}
             with torch.no_grad():
                 logits = self._forward(enc, keep_logits=1).logits[0, -1]
@@ -444,7 +670,10 @@ class HFModel(ModelHandle):
             generated_answer=inference.generated_answer,
             retrieved_context=kept_chunks,
         )
-        return round(full - answer_logit(ablated.prompt), 3)
+        removed = answer_logit(ablated.prompt)
+        if full is None or removed is None:
+            return None
+        return round(full - removed, 3)
 
     @staticmethod
     def _rebuild_prompt(inference: Inference, chunks: list[Chunk]) -> str:
