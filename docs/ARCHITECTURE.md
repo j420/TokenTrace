@@ -49,7 +49,10 @@ context-dilution** discriminator.
 - **Rules (`rules.py`)** — likelihood-ratio accumulators. Each rule contributes
   `weight × activation` log-odds toward one mode and **abstains (0) if any required
   signal is missing** → automatic tier degradation. Includes suppressor rules
-  (correctness, ambiguity-explains-away, gold-attended-so-not-dilution).
+  (correctness, ambiguity-explains-away, gold-attended-so-not-dilution) and one
+  WHITE-exclusive rule (`hal.override_causal`, keyed on `gold_patch_effect`), so
+  the white tier is a genuinely distinct experiment from grey — even though their
+  scores coincide on the saturated synthetic corpus (REPORT §3, §4.2).
 - **Residual (`classifier.py`)** — LightGBM one-vs-rest with the rule log-odds as
   `init_score`; trees fit the residual. Total `z_mode = rule_logit + trees_margin`.
   Native NaN handling routes around missing families.
@@ -64,9 +67,12 @@ context-dilution** discriminator.
   fitted from at least `min_samples` reference-free records
   (`Calibrator.global_admits_noref`) — otherwise `__global__` is the
   reference-bearing map under another name and serving it defeats the `|noref`
-  guard one rung above. A trace that clears no rung gets the raw sigmoid, which is
-  the honest outcome and is what production-shape traces actually get today (see
-  REPORT §4.5).
+  guard one rung above. `train_engine` fits **real `|noref` maps by default**
+  (`fit_noref=True`: a reference-stripped pass over the calibration split), so a
+  production-shape trace is served a map fitted on its own signature; the
+  admission guard remains as a backstop and is currently inert (REPORT §4.5.1). A
+  trace that clears no rung still gets the raw sigmoid, which is the honest
+  outcome.
 - **Conformal (`conformal.py`)** — APS sets over NORMALIZED marginals (the engine
   emits independent one-vs-rest probabilities that do not sum to 1; accumulating
   them raw made tau fit to 1.0 and inverted the set-size signal). Masked modes are
@@ -92,17 +98,19 @@ No public dataset ships `(inference → failure-mode)` labels, so:
 3. **Provenance tiers** — `REAL` (RAGTruth + human seed) → headline eval only;
    `SEMI` + `SYNTHETIC` → train.
 
-**Family-dropout, and where it actually applies.** Training across a per-row tier
-schedule (`[WHITE, GREY, BLACK]` cycled over the training rows) hardens the heads
-against missing families and keeps per-tier calibration honest — but it is a
-property of the *research harness*, not of training in general. It is passed by
-`train_and_evaluate(family_dropout=True)`, `eval/ablations.py` and
-`eval/noref.py`; `train_engine` itself defaults `train_tiers=None`, and
-**`TokenTrace.default()` — the user-facing path, used by the CLI, the API examples
-and the Streamlit app — does not pass it**. The engine a user gets is therefore
-trained at the handle's own tier only. This document previously stated the
-dropout as unconditional; it is not, and the benchmark tables (which do use it)
-are not evidence about the default engine.
+**Family-dropout, and training parity.** Training across a per-row tier schedule
+(`[WHITE, GREY, BLACK]` cycled over the training rows) hardens the heads against
+missing families and keeps per-tier calibration honest. **`TokenTrace.default()` —
+the user-facing path, used by the CLI, the API examples and the Streamlit app —
+now trains with the same schedule as `train_and_evaluate`, `eval/ablations.py`
+and `eval/noref.py`**, so the engine a user gets is the engine the benchmarks
+measure: `tests/test_training_parity.py` asserts the default engine and the
+benchmarked engine are bit-identical (booster dumps and calibrator keys), and
+that the equality is not vacuous (an unscheduled engine differs). An earlier
+revision of this document had to disclose the opposite — `default()` did not pass
+the schedule, so the published tables were not evidence about the shipped engine.
+(`with_tier` can only down-cap, so on a handle opened below WHITE the schedule
+degenerates to the handle's own tier.)
 
 ## Compute-adaptive tiers
 
@@ -137,6 +145,12 @@ What *is* automatic is degradation along the **tier** axis, and only downwards:
 the features land in the missingness mask and every mechanism above keys off them.
 That is the whole auto-degrade story.
 
+Execution status: the `hf` and `nnsight` capture paths run in CI
+(`tests/test_hf_backend.py`, 13 tests) against a ~1M-param model built locally
+from a config — grey+white capture, generation, the signal pipeline, and
+cross-backend feature parity — but have not run against real pretrained weights;
+`gguf` has never executed at all (it needs weights).
+
 ## Fleet triage (`triage/`)
 
 `triage(traces, tt)` streams N inferences through the engine and aggregates them
@@ -165,7 +179,9 @@ first?") rather than the diagnostic one ("why did *this* fail?").
 ## CLI surface
 
 `demo` · `analyze <trace.json>` · **`triage <traces.jsonl>`** · `inject` · `eval` ·
-`ablate`. The first three are user-facing; the last three are the research harness.
+`noref` · `ablate`. The first three are user-facing; the last four are the
+research harness — `noref` runs the no-reference (production-shape) benchmark of
+REPORT §4.5, which was previously reachable only through `scripts/regen_report.py`.
 
 ## Edge cases
 
@@ -180,6 +196,7 @@ first?") rather than the diagnostic one ("why did *this* fail?").
 | retrieval-failure vs dilution | `gold_recall_in_context` (absent vs present) |
 | tokenizer / architecture differences | model-relative features (depth as fraction of layers; normalized attention) via `ModelProfile` |
 | a backend cannot reach white-box capture | `ModelProfile.max_tier` caps the handle; `MechanisticExtractor` catches `TierUnavailable` and the features go MISSING, not zero |
+| ablating the gold chunk would empty the prompt | `gold_patch_effect` is returned as MISSING (`None`) — the causal contrast is undefined there, not zero (`hf.py`) |
 | confident-but-wrong vs unconfident-but-right | confidence family orthogonal to correctness → the 2×2 is a feature |
 
 ## Evaluation (`eval/`)

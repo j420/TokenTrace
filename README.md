@@ -38,6 +38,7 @@ pip install -e .              # dependency-light CPU core (numpy, scikit-learn, 
 tokentrace demo               # train on the offline synthetic corpus + diagnose 5 scenarios
 tokentrace triage log.jsonl   # diagnose a whole log; ranked clusters + the fix for each
 tokentrace eval               # train + evaluate against the proposal's targets
+tokentrace noref              # the no-reference (production-shape) benchmark
 tokentrace ablate             # ablation studies (learned head, per-family, calibration)
 ```
 
@@ -55,35 +56,35 @@ report = triage(load_traces("prod_traces.jsonl"), TokenTrace.default())
 print(render_text(report))
 ```
 
-Real output, pasted verbatim from a run over the 221-trace offline corpus (the
-previous sample here had been hand-edited and no longer matched `render_text`: it
-dropped the abstention split, the `(N unscored)` counts, and the `exemplars:` lines):
+Real output, pasted verbatim from a run over the 221-trace offline corpus,
+regenerated at this revision (two consecutive runs agree byte-for-byte; an earlier
+sample here had been hand-edited and no longer matched `render_text`):
 
 ```text
 triage: 221 traces  analyzed=221  failed=0  tier=white
-  diagnosed 191  healthy 30  declined 0   abstention_rate=0.136 (healthy 0.136 + declined 0.000)
+  diagnosed 192  healthy 29  declined 0   abstention_rate=0.131 (healthy 0.131 + declined 0.000)
 
-failure modes (primary root; 191 diagnosed traces):
-  prompt_ambiguity         31   16.2%
-  retrieval_failure        56   29.3%
-  context_dilution         32   16.8%
-  hallucination            60   31.4%
-  reasoning_failure        12    6.3%
+failure modes (primary root; 192 diagnosed traces):
+  prompt_ambiguity         31   16.1%
+  retrieval_failure        56   29.2%
+  context_dilution         32   16.7%
+  hallucination            60   31.2%
+  reasoning_failure        13    6.8%
 
 top clusters (ranked by n * mean_diagnostic_confidence — a triage ORDER, not measured impact):
-  %diag = share of the 191 DIAGNOSED traces (of 221 supplied); non-finite means print as n/a
+  %diag = share of the 192 DIAGNOSED traces (of 221 supplied); non-finite means print as n/a
    #     n  %diag  conf mode               headline signal             log-odds action             impact
-   1    60  31.4%  1.00 hallucination      parametric_knowledge_score    +12.54 ground_or_abstain  28 fixed / 32 not (0 unscored)
+   1    60  31.2%  1.00 hallucination      parametric_knowledge_score     +6.96 ground_or_abstain  28 fixed / 32 not (0 unscored)
      exemplars: #4, #5, #11   (ground truth on 60/60)
-   2    56  29.3%  0.57 retrieval_failure  gold_recall_in_context        +13.62 add_gold_context   32 fixed / 0 not (24 unscored)
+   2    56  29.2%  0.69 retrieval_failure  gold_recall_in_context        +13.62 add_gold_context   32 fixed / 0 not (24 unscored)
      exemplars: #1, #6, #8   (ground truth on 56/56)
-   3    32  16.8%  0.72 context_dilution   context_length_tokens         +15.40 rerank_gold_first  32 fixed / 0 not (0 unscored)
+   3    32  16.7%  1.00 context_dilution   context_length_tokens         +16.22 rerank_gold_first  32 fixed / 0 not (0 unscored)
      exemplars: #2, #9, #16   (ground truth on 32/32)
-   4    31  16.2%  0.72 prompt_ambiguity   prompt_ambiguity              +16.55 clarify_prompt     20 fixed / 11 not (0 unscored)
+   4    31  16.1%  0.97 prompt_ambiguity   prompt_ambiguity              +16.55 clarify_prompt     20 fixed / 11 not (0 unscored)
      exemplars: #3, #10, #17   (ground truth on 31/31)
-   5    12   6.3%  0.73 reasoning_failure  logit_lens_answer_layer       +13.89 decompose_question 12 fixed / 0 not (0 unscored)
-     exemplars: #108, #109, #110   (ground truth on 12/12)
-  ! Cluster `share` (%diag) is a fraction of the 191 DIAGNOSED traces, not of the 221 supplied (30 healthy, 0 declined, 0 failed).
+   5    13   6.8%  0.95 reasoning_failure  answer_supported_by_context    +7.15 decompose_question 12 fixed / 0 not (1 unscored)
+     exemplars: #42, #108, #109   (ground truth on 13/13)
+  ! Cluster `share` (%diag) is a fraction of the 192 DIAGNOSED traces, not of the 221 supplied (29 healthy, 0 declined, 0 failed).
 ```
 
 Note this run has ground truth on every trace, which is why `impact` is measured at
@@ -111,7 +112,7 @@ rule prior — supplies the strongest evidence line):
            evidence: gold_recall_in_context = 0.0 contributes +13.63 log-odds (learned)
            fix: add_gold_context ✓ validated
      1.00  Hallucination      [sequela] <- Retrieval Failure
-           evidence: parametric_knowledge_score = 0.85 contributes +12.61 log-odds (learned)
+           evidence: parametric_knowledge_score = 0.85 contributes +7.04 log-odds (learned)
            fix: ground_or_abstain ✓ validated
   Top-k set: ['Retrieval Failure', 'Hallucination']
 ```
@@ -152,34 +153,44 @@ on a recommendation metric that *can* fail (16 of 75 simulated fixes did not cor
 the answer). Every figure is regenerated by `scripts/regen_report.py`, never
 transcribed.
 
-**On production-shape traces (no ground truth) the shipped engine scores 0.674, not
-0.977** — and **0.663** when the tier is also dropped to black-box, which is the shape
+**On production-shape traces (no ground truth) the shipped engine scores 0.919, not
+0.977** — and **0.895** when the tier is also dropped to black-box, which is the shape
 traces from `tokentrace.ingest` actually arrive in. Both are measured
-(`tokentrace/eval/noref.py`, [§4.5](docs/REPORT.md)). It mostly fails *quiet* — Top-3
-barely moves (0.954), so the true cause stays in the differential, and what rises is
-silence (declined 0.000 → 0.178). But it does not fail quiet entirely: precision on
-the traces still given a primary root drops to **0.727**, mostly by naming
-hallucination where retrieval failure was the root. Retraining reference-free
-recovers 0.977.
+(`tokentrace/eval/noref.py`, [§4.5](docs/REPORT.md)) and both are now reachable with
+`tokentrace noref`. The failure is quiet and small: Top-3 stays 0.977, declined rises
+only 0.000 → 0.014, and primary-root precision drops 0.973 → **0.919** (68 of 74
+named roots correct), concentrated on retrieval failure (F1 1.00 → 0.87). The
+recovery is not free — the conformal sets that hold coverage at 1.000 widen from
+1.27 to **2.49** modes. Retraining reference-free reaches 0.977.
 
-> The raw transfer number is 0.593. 0.674 is that number with the simulator artifact
-> controlled for — `MockModel._decide` reads gold annotations that no real model sees,
-> so stripping them changes the *simulated model*, not just the evidence. Until this
-> revision that control was asserted in prose; it is now a measured condition and
-> lands where the prose said. §4.5 shows the decomposition and why the rows must not
-> be read additively.
+> These numbers improved this revision by an engineering change, not a correction:
+> `train_engine` now fits real `|noref` calibration maps by default (a
+> reference-stripped pass over the calibration split), so a production-shape trace
+> is served a map actually fitted on its own signature. The previous shipped
+> configuration measured **0.593** raw transfer, **0.674** with the simulator
+> artifact controlled for, and **0.663** at black-box — numbers that were true of
+> the old engine and are kept as a measured counterfactual in §4.5.1. With `|noref`
+> maps in place the artifact control no longer moves anything: the transfer and
+> frozen-mock conditions agree on every metric (§4.5).
 
 > **Read these with the caveats, which are load-bearing:**
 > - The corpus is synthetic and highly separable, so most metrics sit near 1.0. A
 >   shape-only probe (chunk counts and lengths, zero diagnostic content) still
 >   reaches **0.644** against a 0.356 class prior — down from 0.917 before the
->   generator was fixed. The standing test bounds a *related* quantity, not this
->   one: it builds its corpus from `seeds=(0,1,2)` (0.661 vs a 0.304 prior) while
->   the published figure uses `seeds=(0,1,2,3)`. See REPORT §2.1.
-> - **The tiers are not distinguished by this benchmark**, and white ≡ grey exactly
->   (no rule consumes a white-exclusive feature). The differences above are noise on
->   86 test rows.
-> - The **real backends have never executed** (HuggingFace is unreachable here).
+>   generator was fixed. The standing test now builds the same four-seed corpus as
+>   the published figure, so 0.644 is both the published number and the tested one.
+>   See REPORT §2.1.
+> - **The tiers are still not distinguished by this benchmark.** White and grey are
+>   now *distinct experiments* — `hal.override_causal` consumes the WHITE-only
+>   `gold_patch_effect` — but their scores coincide on this saturated corpus, and a
+>   prevalence sweep shows why: the mock's confidence profile already separates the
+>   supposedly mechanistic-only cases at black-box tier (REPORT §4.2, §5). The
+>   differences above are noise on 86 test rows.
+> - The **`hf` and `nnsight` backends now execute**: 13 integration tests drive
+>   grey+white capture, generation, and cross-backend feature parity against a
+>   ~1M-param model built locally from a config (no downloads), in CI. They have
+>   not yet run against real pretrained weights, and **`gguf` has still never
+>   executed** (it needs weights).
 >
 > The [ablations](docs/REPORT.md) are more informative than these headline numbers.
 
@@ -250,7 +261,10 @@ pip install 'tokentrace[mechanistic,generate,retrieval,data]'
   rungs exists. What *is* automatic is tier degradation, downwards only:
   `ModelProfile.max_tier` caps the handle, methods above the handle's tier raise
   `TierUnavailable`, and the mechanistic extractor turns that into *missing*
-  features rather than an error.
+  features rather than an error. Execution status: `hf` and `nnsight` run in CI
+  against a tiny locally-built model (`tests/test_hf_backend.py`; compatibility
+  verified against `transformers` 4.48.3, 4.55.4 and 5.14.1, `nnsight` 0.7.0);
+  `gguf` has never executed — it needs real weights.
 - **Datasets** (`tokentrace/data/loaders.py`): RAGTruth (real hallucination labels),
   HotpotQA, Natural Questions, TruthfulQA → clean seeds for the injection harness.
 - **Retrieval** (`tokentrace/retrieval/rag.py`): FAISS index → `Chunk` lists.
@@ -271,7 +285,8 @@ tokentrace/
   engine/      rules · residual classifier · calibration · conformal · causal · diagnosis
   recommend/   recommendations + simulated-intervention validation
   data/        seed pool · injection harness · synthetic builder · real loaders
-  eval/        metrics · train/eval benchmark · noref (production split)
+  eval/        metrics · train/eval benchmark · noref (production split) ·
+               mechanistic-value prevalence sweep
   retrieval/   FAISS RAG
   cache/       content-addressed on-disk trace cache
   ingest/      trace adapters: openai · langchain · llamaindex · otel · field-map
@@ -281,24 +296,32 @@ tokentrace/
 scripts/       regen_report.py — regenerates every published number from code
 tests/         coherence, tiers, discriminators, causal chain, benchmark, ingest
                adapters, triage clustering, no-reference split + its frozen-mock
-               and black-box controls, headless Streamlit app, shape-shortcut
-               probe, ledger reconciliation, CLI seam
+               and black-box controls, training parity, mechanistic-value sweep,
+               real-backend integration (hf + nnsight on a tiny local model),
+               headless Streamlit app, shape-shortcut probe, ledger
+               reconciliation, CLI seam
 ```
 
-The exact test count is deliberately not quoted here. This README claimed **229**; the
-suite actually collected **252** when that was checked, and **431** a few hours later
-as concurrent work landed. A number nobody regenerates is exactly the kind of claim
-this project is trying not to make, and this one drifts faster than a doc edit can
-follow. Run `python3 -m pytest tests/ --collect-only -q` for the current figure. Note
-the Streamlit suite is skipped unless the `[app]` extra is installed, so the number
-also depends on which extras you have.
+The exact test count is deliberately not quoted as a standing claim. This README
+once said **229**; the suite collected **252** when that was checked, **431** a few
+hours later as concurrent work landed, and **452** when regenerated at this revision
+— measured in an environment *without* the `[app]` and `[mechanistic]` extras, so
+`tests/test_app.py` (Streamlit) and `tests/test_hf_backend.py` (torch) both skip
+and are not in that figure. A number nobody regenerates is exactly the kind of
+claim this project is trying not to make, and this one drifts faster than a doc
+edit can follow. Run `python3 -m pytest tests/ --collect-only -q` for the current
+figure in your own environment.
 
 ## Status & roadmap
 
 - ✅ **Phase 1 (MVP):** full pipeline end-to-end on CPU across all five modes, trained
   + calibrated, meeting targets on the offline benchmark; CLI, tests, Streamlit tool.
-- ⏭ **Phase 2:** wire the GGUF/HF backends to real Qwen3/Gemma3/Phi-4; white-box
-  patching on small models; scale to real datasets; cross-model consistency.
+- ⏳ **Phase 2 (started):** the `hf` and `nnsight` capture paths execute in CI
+  against a tiny locally-built model — no downloads, so not yet real weights.
+  Still open: execute `gguf`; run real Qwen3/Gemma3/Phi-4 end-to-end (the
+  tiny-model recipe proves the path; a laptop with internet can fetch
+  Qwen2.5-0.5B); white-box patching on small models; scale to real datasets;
+  cross-model consistency.
 - ⏭ **Phase 3:** headline benchmark on RAGTruth + human-audited seed; ablations;
   debugging-time user study; report.
 
