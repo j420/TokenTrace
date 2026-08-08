@@ -44,13 +44,19 @@ def test_labels_not_recoverable_from_context_shape(model, pipeline):
     metric was obtainable with zero diagnostic content. Dilution is *causally*
     geometric so some signal is legitimate; the bar is that shape must not be
     sufficient.
+
+    Seeds are (0, 1, 2, 3) — the corpus every published number is computed on
+    (docs/REPORT.md quotes 0.644 vs a 0.356 class prior at these seeds). This test
+    used to build (0, 1, 2), so it bounded a related quantity on a corpus no
+    published figure uses; ``scripts/regen_report.py`` printed both to make the
+    mismatch visible, and this is the alignment it was pointing at.
     """
     import numpy as np
     from sklearn.tree import DecisionTreeClassifier
 
     shape = ["n_chunks", "context_length_tokens", "prompt_n_content_words",
              "answer_length_tokens"]
-    ds = build_dataset(model, pipeline, seeds=(0, 1, 2))
+    ds = build_dataset(model, pipeline, seeds=(0, 1, 2, 3))
     train, _cal, test = split_dataset(ds)
 
     def mk(rows):
@@ -72,7 +78,13 @@ def test_labels_not_recoverable_from_context_shape(model, pipeline):
 
 
 def test_every_recipe_geometry_overlaps(model, pipeline):
-    """No recipe may own a unique chunk-count band (that is the shortcut)."""
+    """No recipe may own a unique chunk-count band (that is the shortcut).
+
+    Deliberately still seeds (0, 1, 2) while the probe test above moved to the
+    published (0, 1, 2, 3): band sets and their unions only grow with seeds, so a
+    pass here implies a pass on the published corpus — the 3-seed form is the
+    stronger and cheaper guard, unlike the probe accuracy, which is not monotone.
+    """
     ds = build_dataset(model, pipeline, seeds=(0, 1, 2))
     counts: dict[str, set] = {}
     for li in ds:

@@ -199,21 +199,31 @@ def result(model):
     return run_noref(model, seeds=(0, 1))
 
 
-def test_frozen_mock_condition_is_reported_and_recovers_the_artifact(result):
-    """(c) must be present, scored, and better than (a).
+def test_frozen_mock_condition_is_reported_and_not_worse_than_transfer(result):
+    """(c) must be present, scored, and never worse than (a) at white tier.
 
-    "Better" is the measurable content of the claim that part of the raw drop was
-    the simulator changing rather than the diagnosis failing. If it ever stops
-    holding, the report's decomposition is wrong and needs re-deriving.
+    REWRITTEN (was: strictly better). With real |noref calibration maps
+    (`train_engine`'s ``fit_noref`` default) the transfer condition recovers the
+    re-decided dilution rows on its own — calibrated probabilities keep them
+    above the primary threshold whether or not the mock re-decided — so on this
+    corpus (c) and (a) now coincide at the metric level and the strict `>` went
+    red for the right reason. The pin itself is still proven to take effect at
+    the DECISION level (`test_frozen_run_leaves_the_simulated_model_unchanged`);
+    what this test now guards is that the control is scored and that removing
+    the artifact never scores WORSE than leaving it in at white tier — if that
+    direction ever flips, the §4.5 decomposition needs re-deriving.
+    Mutation check: `fit_noref=False` on the shipped engine restores the strict
+    gap (0.674 vs 0.593 shape), and `freeze_mock_decisions` returning None for a
+    mock backend turns `available` red.
     """
     block = result["frozen_mock"]
     assert block["available"] is True
     metrics = block["metrics"]
 
     assert isinstance(metrics["diagnosis_accuracy"], float)
-    assert metrics["diagnosis_accuracy"] > result["transfer"]["diagnosis_accuracy"]
-    assert metrics["declined_rate"] < result["transfer"]["declined_rate"]
-    assert block["delta_vs_transfer"]["diagnosis_accuracy"] > 0
+    assert metrics["diagnosis_accuracy"] >= result["transfer"]["diagnosis_accuracy"]
+    assert metrics["declined_rate"] <= result["transfer"]["declined_rate"]
+    assert block["delta_vs_transfer"]["diagnosis_accuracy"] >= 0
     assert block["delta_vs_baseline"]["diagnosis_accuracy"] < 0, \
         "the reference still has to cost something once the artifact is removed"
 
@@ -222,16 +232,29 @@ def test_frozen_mock_condition_is_reported_and_recovers_the_artifact(result):
     assert block["confusion"], "the confusion matrix is the finding, not an extra"
 
 
-def test_the_dilution_collapse_is_the_artifact_and_the_retrieval_one_is_not(result):
-    """The asymmetry is the actual §4.5 result, so it is asserted, not narrated."""
-    transfer = result["per_mode"]["context_dilution"]["transfer"]["f1"]
+def test_noref_calibration_absorbs_the_dilution_artifact(result):
+    """REWRITTEN. The old assertion — freezing the mock must *recover* dilution
+    F1 — pinned the §4.5 asymmetry as it stood when the shipped calibrator had
+    no |noref maps: the artifact (the mock re-deciding stripped dilution rows)
+    cost the transfer condition its dilution mode, and only the freeze got it
+    back. With `fit_noref` calibration the transfer condition diagnoses those
+    rows correctly on its own — the |noref-calibrated dilution probability stays
+    above the primary threshold whether or not the simulated model re-decided —
+    so the artifact's measurable cost is now zero and freezing changes neither
+    mode's F1 on this corpus. That equality is asserted (it is the new §4.5
+    result), not narrated.
+    Mutation check: `fit_noref=False` on the shipped engine restores the old
+    asymmetry (frozen dilution F1 1.0 vs transfer 0.667 on these seeds) and the
+    dilution equality below goes red.
+    """
     frozen = result["frozen_mock"]["metrics"]["per_mode"]
 
-    assert frozen["context_dilution"]["f1"] > transfer, \
-        "freezing the mock must recover the dilution mode; that collapse is an artifact"
+    assert frozen["context_dilution"]["f1"] == \
+        result["per_mode"]["context_dilution"]["transfer"]["f1"], \
+        "with |noref calibration the dilution artifact must cost nothing measurable"
     assert frozen["retrieval_failure"]["f1"] == \
         result["per_mode"]["retrieval_failure"]["transfer"]["f1"], \
-        "the retrieval collapse is a genuine loss and must survive the control unchanged"
+        "retrieval must survive the control unchanged, as it always did"
 
 
 def test_frozen_run_leaves_the_simulated_model_unchanged(model, result):
@@ -299,34 +322,150 @@ def test_black_box_condition_reports_both_losses_separately(result):
     for cfg in ("transfer", "frozen_mock"):
         assert ing[cfg]["recommendation_precision"] == UNAVAILABLE
         assert ing[cfg]["diagnosis_accuracy"] < ing["baseline"]["diagnosis_accuracy"]
-    assert ing["frozen_mock"] != ing["transfer"], "the pin had no effect at this tier"
+    # CHANGED: `frozen_mock != transfer` used to prove the pin took effect, but
+    # that conflated two claims. With |noref calibration the two conditions
+    # legitimately coincide at the metric level (the calibrated maps absorb the
+    # re-decided rows), while the pin's effect on the SIMULATED MODEL is proven
+    # directly by `test_frozen_run_leaves_the_simulated_model_unchanged`. What
+    # must hold here is that the frozen condition was genuinely scored at this
+    # tier, not relabelled from another one.
+    assert isinstance(ing["frozen_mock"]["diagnosis_accuracy"], float)
+    assert ing["delta_vs_same_tier_baseline"]["frozen_mock"] is not None
     assert set(ing["delta_vs_same_tier_baseline"]) == {"transfer", "frozen_mock"}
+    # PROVENANCE, not inference. Adversarial verification relabelled this block
+    # from the transfer metrics (bb_frozen = dict(bb_transfer)) and nothing went
+    # red, because the two conditions coincide metric-for-metric here. The replay
+    # counter on the pinned handle is incremented ONLY when a scoring pass routes
+    # a decision through the pin, so a relabel leaves it at zero.
+    # ...and the white-tier frozen block carries the same provenance count.
+    assert isinstance(result["frozen_mock"]["decisions_replayed"], int)
+    assert result["frozen_mock"]["decisions_replayed"] > 0
+    assert isinstance(ing["frozen_decisions_replayed"], int)
+    assert ing["frozen_decisions_replayed"] > 0, (
+        "the black-tier frozen condition was never scored through the pinned "
+        "handle — its metrics were relabelled from another condition")
 
 
 # --------------------------------------------------------------------------- #
-# 4. The pooled-map flag consults the calibrator's admission predicate
+# 4. The __global__ admission guard is inert now that real |noref maps exist
+# --------------------------------------------------------------------------- #
+def test_the_global_admission_guard_is_now_inert(result):
+    """The §4.5.1 guard-cost table, driven to zero rather than deleted.
+
+    The guard withheld the pooled reference-bearing ``__global__`` map from
+    reference-free traces, and REPORT.md 4.5.1 itemized seven metrics that
+    refusal cost on the transfer condition. The better fix was always to fit
+    real |noref maps so the guard has nothing left to withhold; ``fit_noref``
+    does that, and this test asserts the consequence: forcing the admission
+    predicate open changes NOTHING — every comparable delta is a measured zero,
+    because a stripped trace is served a |noref-fitted map before the ladder
+    ever reaches the pooled rung.
+
+    These zeros CAN fail: the deltas are computed from two genuinely scored
+    ladders, and reverting `fit_noref` (the mutation check) un-fits the |noref
+    maps, flips `guard_live_admits_noref` to False, and reopens every gap the
+    old guard-cost table recorded.
+    """
+    gc = result["guard_cost"]
+    assert gc, "guard_cost must be measured on the shipped engine, not skipped"
+    assert gc["guard_live_admits_noref"] is True
+
+    deltas = gc["delta_after_minus_before"]
+    assert deltas, "the comparable deltas must be reported"
+    assert all(v == 0 for v in deltas.values()), \
+        f"the admission guard still moves metrics: {deltas}"
+    assert gc["n_comparable_metrics_moved"] == 0
+    assert gc["comparable_metrics_moved"] == []
+    # both ladders were really scored — and scored identically, ECE included
+    assert gc["before_guard"] == gc["after_guard"]
+    assert gc["before_guard_confusion"] == result["confusion"]["transfer"]
+    assert gc["before_guard_ece"]["calibrated"]["ece"] == \
+        result["ece"]["transfer"]["calibrated"]["ece"]
+
+
+# --------------------------------------------------------------------------- #
+# 5. The pooled-map flag consults the calibrator's admission predicate
 # --------------------------------------------------------------------------- #
 def test_pooled_map_flag_distinguishes_the_bug_from_the_legitimate_case(result):
     """``noref_served_by_pooled_map`` must not fire on a legitimately mixed pool.
 
-    The (b) retrained engine is calibrated on reference-free data, so its
-    ``__global__`` pool really was shaped by such records and serving it to a
-    reference-free trace is the guard working. A flag that only counted level-2
-    fallbacks would report that as the bug it was written to detect.
+    Both engines are now legitimately mixed: the (b) retrained engine is
+    calibrated on reference-free data, and — CHANGED with the ``fit_noref``
+    default — the (a) shipped engine's calibration also sees a reference-stripped
+    pass over the cal split, so its pool really was shaped by reference-free
+    records too. This test used to assert the shipped engine's pool was
+    UNMIXED (``admits is False``, ``n_noref == 0``); that was the pre-fix state,
+    and asserting it kept the §4.5.1 guard cost alive as a pinned property.
+    Serving an admitted pool to a reference-free trace is the guard working, and
+    a flag that only counted level-2 fallbacks would report it as the bug.
+    Mutation check: dropping the stripped calibration pass in train_engine turns
+    the two `transfer` assertions red.
     """
     transfer = result["calibration_path"]["transfer"]
     retrained = result["calibration_path"]["retrained"]
 
-    assert transfer["global_pool_admits_noref"] is False
-    assert transfer["n_noref_calibration_records"] == 0
+    assert transfer["global_pool_admits_noref"] is True
+    assert transfer["n_noref_calibration_records"] >= 40      # Calibrator.min_samples
     assert retrained["global_pool_admits_noref"] is True
     assert retrained["n_noref_calibration_records"] > 0
-    assert retrained["noref_served_by_pooled_map"] is False, \
-        "an admitted pool is not the bug"
-    # the noref-only tally must be a real subset view, not a copy of the aggregate
     for cp in (transfer, retrained):
+        assert cp["noref_served_by_pooled_map"] is False, \
+            "an admitted pool is not the bug"
+        # the noref-only tally must be a real subset view, not a copy of the aggregate
         for level, n in cp["fallback_levels_noref_rows_only"].items():
             assert n <= cp["fallback_levels"][level]
+
+
+def test_a_mixed_pooled_bucket_is_validated_per_population_not_only_on_the_mixture():
+    """The ``__global__`` pool now genuinely mixes reference-bearing and
+    reference-free records (train_engine's ``fit_noref``), but it is served to
+    one population at a time — so a candidate map that models the population
+    CONTRAST can beat the raw sigmoid on the pooled holdout while making one
+    population's probabilities strictly worse. Measured origin: under
+    observation noise 0.75 (``run_robustness``) the pooled map was adopted on
+    the mixture and pushed reference-bearing calibrated ECE to 0.0683 against a
+    0.0077 raw sigmoid. ``Calibrator._fit_validated`` therefore also requires
+    the candidate not to be worse than the sigmoid on each population that
+    meaningfully shaped the bucket (>= min_samples records of it).
+
+    The construction: the two populations have INVERTED label structure at the
+    same z, so the pooled fit lands near 0.5 — a big Brier win over the sigmoid
+    on the pool (the noref half is far off), and a strict loss on the
+    reference-bearing half (whose sigmoid was nearly perfect).
+    Mutation check: disabling the population gate in ``_fit_validated`` adopts
+    the ``__global__`` bucket here and the first assertion goes red.
+    """
+    from tokentrace.engine.calibration import Calibrator
+
+    recs = []
+    for _ in range(50):
+        recs += [
+            {"mode": FailureMode.HALLUCINATION, "signature": "prompt+retrieval",
+             "z": 2.0, "label": 1},
+            {"mode": FailureMode.HALLUCINATION, "signature": "prompt+retrieval",
+             "z": -2.0, "label": 0},
+            {"mode": FailureMode.HALLUCINATION, "signature": "prompt+retrieval|noref",
+             "z": 2.0, "label": 0},
+            {"mode": FailureMode.HALLUCINATION, "signature": "prompt+retrieval|noref",
+             "z": -2.0, "label": 1},
+        ]
+    cal = Calibrator().fit(recs)
+
+    key = (FailureMode.HALLUCINATION.value, "__global__")
+    assert key not in cal.maps, \
+        "a pooled map that hurts the reference-bearing population was adopted"
+    # the per-population rungs stay free to adopt on their own merits, so the
+    # gate is a refusal to cross populations, not a refusal to calibrate: a
+    # reference-free trace is still served its own coarse map...
+    assert (FailureMode.HALLUCINATION.value, "__noref__") in cal.maps
+    cal.transform(FailureMode.HALLUCINATION, "prompt+retrieval|noref", 2.0)
+    assert cal.last_fallback <= 1
+    # ...and the (already well-calibrated) reference-bearing trace falls through
+    # to the raw sigmoid rather than being served the contrast-fitting pool.
+    cal.maps.pop((FailureMode.HALLUCINATION.value, "prompt+retrieval"), None)
+    cal.maps.pop((FailureMode.HALLUCINATION.value, "__ref__"), None)
+    cal.transform(FailureMode.HALLUCINATION, "prompt+retrieval", 2.0)
+    assert cal.last_fallback == 3
 
 
 class _StubCalibrator:
@@ -403,3 +542,31 @@ def test_pooled_map_flag_counts_noref_rows_only_and_defers_to_the_admission_pred
     assert legit["fallback_levels_noref_rows_only"]["global_pooled"] > 0
     assert legit["noref_served_by_pooled_map"] is False
     assert legit["noref_served_by_admitted_pooled_map"] is True
+
+
+# --------------------------------------------------------------------------- #
+# 5. The guard-cost zeros must be FALSIFIABLE
+# --------------------------------------------------------------------------- #
+def test_guard_cost_machinery_reproduces_the_nonzero_table_without_noref_maps(model):
+    """The inert-guard zeros are a measurement only if the same machinery can
+    still produce the nonzero table.
+
+    On the default path (fit_noref=True) the force-admission inside run_noref's
+    guard-cost block is a no-op — the calibrator already admits — so every delta
+    is a deterministic run compared with itself. Adversarial verification neutered
+    the force-admission entirely and 31/31 tests stayed green: the zeros could
+    not fail. This companion runs the SAME machinery on an engine trained without
+    the stripped calibration pass, where the guard still has something to
+    withhold; the deltas must reappear. Neutering the force-admission now zeroes
+    THIS table too, and this test goes red.
+    """
+    res = run_noref(model, seeds=(0, 1), fit_noref=False)
+    gc = res["guard_cost"]
+    assert gc["guard_live_admits_noref"] is False
+    moved = gc["n_comparable_metrics_moved"]
+    assert isinstance(moved, int) and moved > 0, (
+        "with no |noref maps the admission guard must have a measurable cost; "
+        "zero moved metrics here means the before/after ladders were not "
+        "genuinely scored under different admission states")
+    deltas = gc["delta_after_minus_before"]
+    assert any(abs(v) > 0 for v in deltas.values() if isinstance(v, (int, float)))
