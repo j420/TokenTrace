@@ -6,6 +6,7 @@
     tokentrace inject --out d.jsonl # build the synthetic labeled corpus
     tokentrace eval                 # train + evaluate against the targets
     tokentrace ablate               # ablations + the observation-noise sweep
+    tokentrace noref                # the no-reference (production-shape) benchmark
 
 `analyze` and `triage` read TokenTrace's own trace JSON *and* real production logs:
 `--source auto|openai_chat|langchain|llamaindex|otel|generic|tokentrace` routes
@@ -21,7 +22,7 @@ import sys
 from pathlib import Path
 from typing import Any, Iterator, NoReturn, Optional
 
-from tokentrace.core.types import Chunk, Inference, Tier
+from tokentrace.core.types import ALL_MODES, Chunk, Inference, Tier
 from tokentrace.core.serialize import inference_from_dict, labeled_to_dict, report_to_dict
 
 _TIER = {"black": Tier.BLACK, "grey": Tier.GREY, "white": Tier.WHITE}
@@ -383,6 +384,69 @@ def _print_ablations(res: dict, robustness: dict, model_label: str) -> None:
               f"{mm['ece_calibrated']:8.4f}")
 
 
+def _cell(x, fmt: str = "6.3f", width: int = 6) -> str:
+    """Format a metric that may be ``noref``'s explicit UNAVAILABLE marker.
+
+    ``run_noref`` replaces every ground-truth-dependent metric with a string rather
+    than a 0.0, precisely so a reader cannot mistake "not measurable" for "measured
+    zero". A printer that crashed on it — or worse, coerced it — would undo that, so
+    the marker renders as an obvious dash (same convention as scripts/regen_report.py).
+    """
+    if isinstance(x, (int, float)):
+        return format(x, fmt)
+    return "-".rjust(width)
+
+
+def _print_noref(nr: dict, model_label: str) -> None:
+    """The §4.5 (no-reference / production split) tables, regen_report style.
+
+    Reads only the keys it prints and looks optional blocks up with ``.get``:
+    ``run_noref`` is an evolving result dict — ``frozen_mock.metrics`` is None on a
+    real backend, ``ingest_shape`` is empty when the ingest tier equals the scoring
+    tier, and new top-level keys must pass through without breaking the printer.
+    """
+    print(f"model: {model_label}")
+    print(f"no-reference (production) split — tier={nr['tier']}, "
+          f"test n={nr['sizes']['test']}:")
+
+    cond = [("baseline", nr["baseline"]), ("transfer", nr["transfer"])]
+    frozen = (nr.get("frozen_mock") or {}).get("metrics")
+    if frozen is not None:
+        cond.append(("frozen-mock", frozen))
+    cond.append(("retrained", nr["retrained"]))
+
+    print(f"  {'condition':12s} {'diag':>6s} {'top3':>6s} {'cov':>6s} {'set':>5s} "
+          f"{'declnd':>6s} {'dbg':>6s} {'rank':>5s} {'recP':>6s}")
+    for name, m in cond:
+        print(f"  {name:12s} {m['diagnosis_accuracy']:6.3f} {m['top3_accuracy']:6.3f} "
+              f"{m['conformal_coverage']:6.3f} {m['conformal_set_size']:5.2f} "
+              f"{m['declined_rate']:6.3f} {m['debugging_time_reduction']:6.3f} "
+              f"{m['mean_root_rank']:5.2f} {_cell(m['recommendation_precision'])}")
+
+    print("\n  per-mode F1 (support from the baseline run):")
+    names = [n for n, _ in cond]
+    print("    " + f"{'mode':20s}" + "".join(f"{n[:6]:>7s}" for n in names) + f"{'supp':>6s}")
+    for mode in ALL_MODES:
+        cells = "".join(f"{m['per_mode'][mode.value]['f1']:7.2f}" for _, m in cond)
+        supp = nr["baseline"]["per_mode"][mode.value]["support"]
+        print(f"    {mode.value:20s}{cells}{supp:6d}")
+
+    ing = nr.get("ingest_shape") or {}
+    if ing:
+        print(f"\n  ingest shape — no reference AND no mechanistic capture "
+              f"(tier={ing['tier']}):")
+        rows = [("baseline", ing["baseline"]), ("transfer", ing["transfer"])]
+        if ing.get("frozen_mock"):
+            rows.append(("frozen-mock", ing["frozen_mock"]))
+        for name, m in rows:
+            print(f"    {name:12s} diag={m['diagnosis_accuracy']:6.3f} "
+                  f"top3={m['top3_accuracy']:6.3f} declined={m['declined_rate']:6.3f} "
+                  f"dbg={m['debugging_time_reduction']:6.3f} "
+                  f"halluc.F1={m['per_mode']['hallucination']['f1']:.2f} "
+                  f"retr.F1={m['per_mode']['retrieval_failure']['f1']:.2f} "
+                  f"dil.F1={m['per_mode']['context_dilution']['f1']:.2f}")
+
+
 def _print_inject(summary: dict, n: int, out: str) -> None:
     _emit_json(summary)
     print(f"wrote {n} labeled examples -> {out}")
@@ -480,6 +544,24 @@ def cmd_ablate(args) -> int:
     return 0
 
 
+def cmd_noref(args) -> int:
+    from tokentrace.eval.noref import run_noref
+
+    seeds = _parse_seeds(args.seeds)
+    # Like `eval`/`ablate`: the condition table IS the output — the white-box score
+    # and the black-tier ingest condition are both swept inside — so the handle
+    # opens at its ceiling and there is deliberately no --tier flag.
+    model = _load_model(args.model, args.backend, Tier.WHITE)
+    # Keywords only: run_noref grows keyword-compatibly, so a positional call is
+    # the one shape that could silently rebind an argument.
+    res = run_noref(model=model, seeds=seeds)
+    if args.json:
+        _emit_json({**res, "model": args.model, "backend": args.backend})
+        return 0
+    _print_noref(res, f"{args.model} (backend={args.backend}, tier={model.tier.label})")
+    return 0
+
+
 def cmd_triage(args) -> int:
     from tokentrace.triage import render_text, triage
 
@@ -574,6 +656,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     tr.add_argument("--top", type=int, default=10, help="clusters to show (default 10)")
     tr.add_argument("--json", action="store_true")
     tr.set_defaults(func=cmd_triage)
+
+    nr = sub.add_parser("noref", parents=[common],
+                        help="the no-reference (production-shape) benchmark: strip "
+                             "ground truth + gold annotations and re-score against "
+                             "the reference-bearing baseline (runtime ~20-60 s)",
+                        description="Measures the shipped engine on traces stripped of "
+                                    "their reference metadata — the shape a production "
+                                    "trace arrives in — next to the reference-bearing "
+                                    "baseline, the frozen-mock artifact control and the "
+                                    "black-tier ingest condition. Sweeps its own tiers, "
+                                    "so there is no --tier flag. Runtime is ~20-60 s "
+                                    "on the mock backend.")
+    nr.add_argument("--seeds", default="0,1,2,3")
+    nr.add_argument("--json", action="store_true")
+    nr.set_defaults(func=cmd_noref)
 
     ab = sub.add_parser("ablate", parents=[common],
                         help="ablation studies (learned head, per-family, calibration) "
