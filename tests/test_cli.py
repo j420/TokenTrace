@@ -37,7 +37,7 @@ import re
 
 import pytest
 
-from tokentrace.cli import cmd_ablate, cmd_eval, main
+from tokentrace.cli import cmd_ablate, cmd_eval, cmd_noref, main
 from tokentrace.core.serialize import inference_to_dict
 from tokentrace.core.types import (
     Chunk,
@@ -102,14 +102,29 @@ def trace_log(tmp_path_factory):
 # --------------------------------------------------------------------------- #
 # triage
 def test_triage_renders_a_ranked_report(trace_log, capsys):
+    """The bucket COUNTS on the text row must be the ones the data produced.
+
+    The first version asserted only that the words "diagnosed"/"healthy"/"declined"
+    appeared — but those are literals in ``render_text``'s format string, so merging
+    two buckets into one number left the assertion green. The counts are therefore
+    read from the ``--json`` view of the SAME log and compared against the text row.
+    """
+    assert main(["triage", str(trace_log), "--fast", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    diagnosed, healthy, declined = (payload["n_diagnosed"], payload["n_healthy"],
+                                    payload["n_abstained"])
+    # Precondition: the canonical 5-trace log must populate more than one bucket,
+    # or a merged-buckets regression would be invisible to the row assert below.
+    assert diagnosed + healthy + declined == payload["n_analyzed"] == 5, payload
+    assert diagnosed > 0 and healthy > 0, payload
+
     assert main(["triage", str(trace_log), "--fast"]) == 0
     out = capsys.readouterr().out
     assert "top clusters" in out
     # The counts must come from the input, not from a constant.
     assert "triage: 5 traces  analyzed=5" in out, out
-    # The three buckets must be reported separately, never merged into one number.
-    for word in ("diagnosed", "healthy", "declined"):
-        assert word in out, out
+    # Each bucket must carry ITS OWN count — merging any two moves a number here.
+    assert f"diagnosed {diagnosed}  healthy {healthy}  declined {declined}" in out, out
 
 
 def test_triage_json_is_strict_json(trace_log, capsys):
@@ -291,6 +306,7 @@ def test_field_map_and_a_conflicting_source_is_rejected(tmp_path):
     (["eval", "--seeds", ""], "empty"),
     (["ablate", "--seeds", "0,,1"], "empty entry"),
     (["inject", "--seeds", "1.5"], "not an integer"),
+    (["noref", "--seeds", "x,1"], "not an integer"),
 ])
 def test_a_bad_seed_list_is_an_error_not_a_traceback(argv, needle):
     with pytest.raises(SystemExit) as exc:
@@ -381,11 +397,11 @@ def _install_stub(monkeypatch, report):
     return seen
 
 
-@pytest.mark.parametrize("cmd", ["eval", "ablate"])
+@pytest.mark.parametrize("cmd", ["eval", "ablate", "noref"])
 def test_tier_is_not_offered_where_it_would_be_ignored(cmd):
     """It used to sit in the shared parent parser: advertised by ``--help`` on both
-    commands, and hard-coded to WHITE in both bodies. Both sweep every tier and print
-    the curve, so the flag had nothing to mean."""
+    commands, and hard-coded to WHITE in both bodies. All of these sweep every tier
+    they report and print the curve, so the flag had nothing to mean."""
     with pytest.raises(SystemExit) as exc:
         main([cmd, "--tier", "black"])
     assert exc.value.code == 2
@@ -791,6 +807,197 @@ def test_run_robustness_default_handle_matches_an_explicit_mock_handle():
 
 
 # --------------------------------------------------------------------------- #
+# printer: cmd_noref — the production-mode measurement, fixture-driven per the
+# module docstring: every value unique across fields, modes, conditions and blocks.
+_NOREF_KEYS = ("diagnosis_accuracy", "top3_accuracy", "conformal_coverage",
+               "conformal_set_size", "declined_rate", "debugging_time_reduction",
+               "mean_root_rank", "recommendation_precision")
+
+_MODES = ("prompt_ambiguity", "retrieval_failure", "context_dilution",
+          "hallucination", "reasoning_failure")
+
+
+def _noref_metrics(tag: int, unavailable: bool = False) -> dict:
+    """One condition block shaped like ``Metrics.as_dict()`` after ``run_noref``'s
+    post-processing. ``unavailable=True`` gives it the UNAVAILABLE marker the real
+    stripped conditions carry instead of a recommendation precision."""
+    from tokentrace.eval.noref import UNAVAILABLE
+
+    m = {k: round(tag / 10 + i / 1000, 4) for i, k in enumerate(_NOREF_KEYS)}
+    if unavailable:
+        m["recommendation_precision"] = UNAVAILABLE
+    m["per_mode"] = {mode: {"precision": round(tag / 10 + j / 100 + 0.001, 3),
+                            "recall": round(tag / 10 + j / 100 + 0.002, 3),
+                            "f1": round(tag / 10 + j / 100, 2),
+                            "support": 30 + 10 * tag + j}
+                     for j, mode in enumerate(_MODES)}
+    return m
+
+
+def _noref_row(m: dict) -> list[float]:
+    """The condition-table row the printer must produce for block ``m``."""
+    row = _round(m["diagnosis_accuracy"], m["top3_accuracy"], m["conformal_coverage"])
+    row += [round(m["conformal_set_size"], 2)]
+    row += _round(m["declined_rate"], m["debugging_time_reduction"])
+    row += [round(m["mean_root_rank"], 2)]
+    if isinstance(m["recommendation_precision"], float):
+        row += _round(m["recommendation_precision"])
+    return row
+
+
+def _noref_fixture() -> dict:
+    """Shaped like ``run_noref`` output (asserted against the producer by
+    ``test_noref.py``); condition tags: baseline=1, transfer=2, frozen=3,
+    retrained=4, and 5/6/7 for the ingest-shape block."""
+    conds = {"baseline": _noref_metrics(1),
+             "transfer": _noref_metrics(2, unavailable=True),
+             "retrained": _noref_metrics(4, unavailable=True)}
+    return {
+        **conds,
+        "sizes": {"train": 81, "cal": 82, "test": 83},
+        "tier": "white",
+        "frozen_mock": {"note": "n", "metrics": _noref_metrics(3, unavailable=True),
+                        "confusion": {}, "delta_vs_baseline": {},
+                        "delta_vs_transfer": {}, "available": True},
+        "delta_vs_baseline": {"transfer": {}, "retrained": {}},
+        "per_mode": {mode: {name: m["per_mode"][mode] for name, m in conds.items()}
+                     for mode in _MODES},
+        "confusion": {name: {} for name in conds},
+        "retrieval_vs_dilution": {"prediction": "p", "held": True},
+        "unavailable_metrics": {},
+        "calibration_path": {name: {} for name in conds},
+        "ece": {name: {"uncalibrated": {}, "calibrated": {}} for name in conds},
+        "confound_controls": {"note": "n"},
+        "ingest_shape": {
+            "tier": "black", "note": "n",
+            "baseline": _noref_metrics(5),
+            "transfer": _noref_metrics(6, unavailable=True),
+            "frozen_mock": _noref_metrics(7, unavailable=True),
+            "delta_vs_same_tier_baseline": {}, "delta_vs_full_capture": {},
+            "confusion": {}, "calibration_path": {},
+        },
+        "guard_cost": {"note": "n"},
+        # run_noref is actively growing; the printer must pass unknown keys through.
+        "a_block_the_printer_has_never_heard_of": {"x": 1.0},
+    }
+
+
+def _install_noref(monkeypatch, res=None) -> dict:
+    import tokentrace.eval.noref as noref_mod
+
+    seen: dict = {}
+
+    def fake(**kw):        # keyword-only on purpose: a positional call must break here
+        seen.update(kw)
+        return _noref_fixture() if res is None else res
+
+    monkeypatch.setattr(noref_mod, "run_noref", fake)
+    return seen
+
+
+def test_noref_prints_the_condition_table_from_each_conditions_own_data(monkeypatch, capsys):
+    seen = _install_noref(monkeypatch)
+    assert cmd_noref(_Args(seeds="0,2", json=False, model="qwen3-0.6b")) == 0
+    out = capsys.readouterr().out
+
+    # the producer got the parsed seeds and the --model/--backend handle, at white
+    assert seen["seeds"] == (0, 2), seen
+    assert seen["model"].profile.name == "qwen3-0.6b", seen
+    assert seen["model"].tier is Tier.WHITE, seen
+
+    assert "model: qwen3-0.6b (backend=mock, tier=white)" in out, out
+    table = _after(out, "no-reference")
+    assert "tier=white" in table and "test n=83" in table, out
+    for name, tag in (("baseline", 1), ("transfer", 2), ("frozen-mock", 3),
+                      ("retrained", 4)):
+        assert _row(table, name) == _noref_row(_noref_metrics(
+            tag, unavailable=(tag != 1))), out
+    # UNAVAILABLE renders as a dash — never raw, never coerced to a number.
+    assert "UNAVAILABLE" not in out, out
+
+
+def test_noref_prints_the_per_mode_block_from_each_condition(monkeypatch, capsys):
+    _install_noref(monkeypatch)
+    assert cmd_noref(_Args(seeds="0", json=False)) == 0
+    pm = _after(capsys.readouterr().out, "per-mode F1")
+    for j, mode in enumerate(_MODES):
+        # one F1 per condition, each from ITS block (tags 1..4), baseline support
+        assert _row(pm, mode) == [round(t / 10 + j / 100, 2) for t in (1, 2, 3, 4)], pm
+        line = next(ln for ln in pm.splitlines() if ln.strip().startswith(mode))
+        assert line.split()[-1] == str(30 + 10 * 1 + j), pm
+
+
+def test_noref_prints_the_ingest_shape_block_when_present(monkeypatch, capsys):
+    _install_noref(monkeypatch)
+    assert cmd_noref(_Args(seeds="0", json=False)) == 0
+    ing = _after(capsys.readouterr().out, "ingest shape")
+    assert "tier=black" in ing, ing
+    for name, tag in (("baseline", 5), ("transfer", 6), ("frozen-mock", 7)):
+        m = _noref_metrics(tag, unavailable=(tag != 5))
+        assert _row(ing, name) == _round(
+            m["diagnosis_accuracy"], m["top3_accuracy"], m["declined_rate"],
+            m["debugging_time_reduction"]) + [
+            m["per_mode"]["hallucination"]["f1"],
+            m["per_mode"]["retrieval_failure"]["f1"],
+            m["per_mode"]["context_dilution"]["f1"]], ing
+
+
+def test_noref_tolerates_a_result_without_the_optional_blocks(monkeypatch, capsys):
+    """A real backend has no frozen-mock control (`metrics` is None), and
+    `ingest_shape`/`guard_cost` may be absent entirely; unknown extra keys are
+    already in every fixture above. None of that may crash or invent a row."""
+    res = _noref_fixture()
+    res["frozen_mock"] = {"note": "n", "metrics": None, "confusion": {},
+                          "delta_vs_baseline": None, "delta_vs_transfer": None,
+                          "available": False}
+    del res["ingest_shape"]
+    del res["guard_cost"]
+    _install_noref(monkeypatch, res=res)
+    assert cmd_noref(_Args(seeds="0", json=False)) == 0
+    out = capsys.readouterr().out
+    assert "frozen-mock" not in out, out
+    assert "ingest shape" not in out, out
+    # ...and the required blocks still render from their own data.
+    table = _after(out, "no-reference")
+    for name, tag in (("baseline", 1), ("transfer", 2), ("retrained", 4)):
+        assert _row(table, name) == _noref_row(_noref_metrics(
+            tag, unavailable=(tag != 1))), out
+
+
+def test_noref_json_is_strict_json_and_keeps_the_unavailable_marker(monkeypatch, capsys):
+    from tokentrace.eval.noref import UNAVAILABLE
+
+    res = _noref_fixture()
+    res["baseline"]["conformal_coverage"] = float("nan")
+    res["frozen_mock"]["metrics"]["mean_root_rank"] = float("inf")
+    _install_noref(monkeypatch, res=res)
+    assert cmd_noref(_Args(seeds="0", json=True)) == 0
+    raw = capsys.readouterr().out
+    assert "NaN" not in raw and "Infinity" not in raw, raw
+    payload = json.loads(raw)                                  # strict by default
+    assert payload["baseline"]["conformal_coverage"] is None
+    assert payload["frozen_mock"]["metrics"]["mean_root_rank"] is None
+    # "not measurable" must survive to the JSON consumer as the marker, not as 0.0
+    assert payload["transfer"]["recommendation_precision"] == UNAVAILABLE
+    assert payload["transfer"]["diagnosis_accuracy"] == \
+        _noref_metrics(2)["diagnosis_accuracy"]
+    assert payload["ingest_shape"]["transfer"]["top3_accuracy"] == \
+        _noref_metrics(6)["top3_accuracy"]
+    assert payload["model"] == "mock-4b" and payload["backend"] == "mock"
+
+
+def test_noref_smoke_really_runs_the_benchmark(capsys):
+    """The one test here that runs the real producer (single seed, mock backend,
+    ~5-15 s); everything above drives the printer against fixtures."""
+    assert main(["noref", "--seeds", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "no-reference" in out, out
+    for name in ("baseline", "transfer", "frozen-mock", "retrained"):
+        assert len(_row(out, name)) >= 7, out       # a full row of real metrics
+    assert "per-mode F1" in out and "ingest shape" in out, out
+
+
+# --------------------------------------------------------------------------- #
 # printer: cmd_inject
 def test_inject_summary_describes_the_file_it_wrote(tmp_path, capsys):
     out_path = tmp_path / "ds.jsonl"
@@ -811,7 +1018,7 @@ def test_inject_summary_describes_the_file_it_wrote(tmp_path, capsys):
 def test_every_documented_subcommand_is_registered():
     import argparse
 
-    for cmd in ("demo", "analyze", "triage", "inject", "eval", "ablate"):
+    for cmd in ("demo", "analyze", "triage", "inject", "eval", "ablate", "noref"):
         with pytest.raises((SystemExit, argparse.ArgumentError)) as exc:
             main([cmd, "--definitely-not-a-flag"])
         # exit code 2 == argparse rejected the flag, i.e. the subcommand exists.
@@ -824,5 +1031,5 @@ def test_the_top_level_help_lists_every_subcommand(capsys):
         main(["--help"])
     out = capsys.readouterr().out
     described = out.split("positional arguments")[0]
-    for cmd in ("demo", "analyze", "triage", "inject", "eval", "ablate"):
+    for cmd in ("demo", "analyze", "triage", "inject", "eval", "ablate", "noref"):
         assert f"tokentrace {cmd}" in described, described
