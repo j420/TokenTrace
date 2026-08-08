@@ -23,19 +23,42 @@ from tokentrace.signals.features import ALL_FEATURES
 from tokentrace.signals.registry import SignalPipeline
 
 
+#: Seed stride for the extra override replicas requested via ``override_weight``.
+#: Virtual seeds ``s + k * _OVERRIDE_SEED_STRIDE`` (k >= 1) stay disjoint from any
+#: realistic base-seed range, so replicas are genuinely distinct rows (different
+#: filler counts / gold positions), not duplicates for the dedup pass to delete.
+_OVERRIDE_SEED_STRIDE = 1000
+
+
 def build_dataset(
     model: ModelHandle,
     pipeline: Optional[SignalPipeline] = None,
     seeds: tuple[int, ...] = (0, 1, 2),
+    override_weight: int = 1,
 ) -> list[LabeledInference]:
+    """Build the injected corpus.
+
+    ``override_weight`` controls the PREVALENCE of the mechanistically-separable
+    cases: each (fact, seed) contributes ``override_weight`` hallucination_override
+    rows (extra replicas use disjoint virtual seeds, so they are distinct rows).
+    The default of 1 is byte-identical to the historical corpus — same rows, same
+    order, same labels — which tests/test_mechanistic_value.py pins by hash.
+    ``override_weight=0`` removes the override class entirely.
+    """
+    if override_weight < 0:
+        raise ValueError(f"override_weight must be >= 0, got {override_weight}")
     harness = InjectionHarness(model, pipeline)
     out: list[LabeledInference] = []
     for s in seeds:
         for fact in FACTS:
             for recipe in (harness.clean, harness.retrieval_failure, harness.context_dilution,
-                           harness.prompt_ambiguity, harness.hallucination,
-                           harness.hallucination_override):
+                           harness.prompt_ambiguity, harness.hallucination):
                 li = recipe(fact, seed=s)
+                if li is not None:
+                    out.append(li)
+            for k in range(override_weight):
+                li = harness.hallucination_override(
+                    fact, seed=s if k == 0 else s + k * _OVERRIDE_SEED_STRIDE)
                 if li is not None:
                     out.append(li)
             if fact.parametric:

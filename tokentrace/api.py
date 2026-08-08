@@ -50,13 +50,25 @@ class TokenTrace:
             engine = DiagnosisEngine(recommender=Recommender(model=model))
             return cls(model, engine, pipeline)
 
-        # Train on the synthetic corpus (offline, no downloads).
+        # Train on the synthetic corpus (offline, no downloads), with the SAME
+        # family-dropout tier schedule as train_and_evaluate / run_ablations /
+        # run_noref. This is the parity that makes the published tables evidence
+        # about THIS engine: without the schedule, default() trained at the
+        # handle's own tier only, so demo/analyze/triage and the Streamlit app
+        # were running an engine the benchmarks never measured. (`with_tier` can
+        # only down-cap, so on a handle opened below WHITE the schedule
+        # degenerates to the handle's tier — the same behaviour as before.)
         from tokentrace.data.synthetic import build_dataset
-        from tokentrace.eval.benchmark import split_dataset, train_engine
+        from tokentrace.eval.benchmark import (
+            family_dropout_schedule,
+            split_dataset,
+            train_engine,
+        )
 
         dataset = build_dataset(model, pipeline, seeds=seeds)
         train, cal, _ = split_dataset(dataset)
-        engine = train_engine(train, cal, model, pipeline)
+        engine = train_engine(train, cal, model, pipeline,
+                              train_tiers=family_dropout_schedule(len(train)))
         return cls(model, engine, pipeline)
 
     # ------------------------------------------------------------------ #

@@ -5,9 +5,11 @@ model-relative. The numbers here are sensible defaults/hints; when a real HF
 model is loaded the exact values (n_layers, n_heads, d_model) are read from its
 config and overwrite these.
 
-``max_tier`` records how far the mechanistic fallback ladder can go for a model.
-If TransformerLens/hooks cannot reach a model, drop its ``max_tier`` to GREY and
-the tier system handles the rest — no special-casing.
+``max_tier`` records how far up the TIER ladder (black -> grey -> white) capture
+can go for a model. If grey/white capture cannot reach a model, drop its
+``max_tier`` and the tier system handles the rest — no special-casing. Backends
+themselves (mock/gguf/hf/nnsight) are chosen explicitly via :func:`load_model`;
+there is no automatic backend-to-backend fallback.
 """
 
 from __future__ import annotations
@@ -36,8 +38,10 @@ PROFILES: dict[str, ModelProfile] = {
     ),
     "gemma3-4b": ModelProfile(
         name="gemma3-4b", n_layers=34, n_heads=16, d_model=2560,
-        # Gemma 3 multimodal has known TransformerLens quirks -> cap capture at grey
-        # until a clean bridge lands; grey-box (HF attentions/hidden states) is fine.
+        # Gemma 3 is a composite multimodal model (language model nested under
+        # vision tower + projector) -> cap capture at grey until the white-box
+        # ablation path is validated on that layout; grey-box (HF
+        # attentions/hidden states) is fine.
         max_tier=Tier.GREY,
         gguf_repo="google/gemma-3-4b-it-qat-q4_0-gguf", hf_repo="google/gemma-3-4b-it",
     ),
@@ -61,6 +65,17 @@ def get_profile(name: str) -> ModelProfile:
     if name not in PROFILES:
         raise KeyError(f"unknown model '{name}'. known: {sorted(PROFILES)}")
     return PROFILES[name]
+
+
+def register_profile(profile: ModelProfile) -> ModelProfile:
+    """Register (or replace) a profile under ``profile.name``.
+
+    The supported way to point :func:`load_model` at a model that is not in the
+    built-in table — e.g. a locally-built dev model in tests — instead of
+    mutating :data:`PROFILES` inline.
+    """
+    PROFILES[profile.name] = profile
+    return profile
 
 
 def load_model(

@@ -43,3 +43,38 @@ jobs:
             echo "::error::no app test passed — streamlit missing, so the whole file skipped"
             exit 1
           }
+
+  # Real-backend integration: tests/test_hf_backend.py drives the ACTUAL
+  # HFModel/NNsightModel capture+generation paths against a ~1M-param model built
+  # locally from a config — no model downloads (the test file sets
+  # HF_HUB_OFFLINE), so the only network cost is the wheels. BLOCKING by design:
+  # the test is deterministic (seeded weights, greedy paths) and the hf and
+  # nnsight backends previously had ZERO CI coverage, so a failure here is a
+  # real capture-path regression, not flake. (gguf is NOT exercised: it still
+  # needs weights no CI can build locally.)
+  backend-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # CPU torch first (~200MB wheel) so the `mechanistic` extra's plain
+      # `torch>=2.2` pin is already satisfied and pip never resolves the
+      # multi-GB CUDA wheel stack on a GPU-less runner.
+      - name: Install (CPU torch + mechanistic extra — no GPU, no model downloads)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev,mechanistic]"
+      # Same pattern as the app job: the file importorskips torch, so "all
+      # skipped" would otherwise look green. Require at least one PASS.
+      - name: Backend tests (must RUN, not skip)
+        run: |
+          pytest tests/test_hf_backend.py -q 2>&1 | tee /tmp/backend.log
+          grep -qE '[0-9]+ passed' /tmp/backend.log || {
+            echo "::error::no backend test passed — torch missing, so the whole file skipped"
+            exit 1
+          }

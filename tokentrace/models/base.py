@@ -10,8 +10,9 @@ Concrete backends:
 
 The interface is deliberately capability-gated: a handle advertises a ``tier`` and
 the methods above ``tier`` raise :class:`TierUnavailable`. This is what makes the
-compute-adaptive degradation (and the "TransformerLens doesn't support this model"
-fallback) a property of one object rather than branches everywhere.
+compute-adaptive degradation (and "this model's capture backend cannot reach
+white-box, cap it at grey" — ``ModelProfile.max_tier``) a property of one object
+rather than branches everywhere.
 """
 
 from __future__ import annotations
