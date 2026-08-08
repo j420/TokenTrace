@@ -413,12 +413,6 @@ def _scored_recommendations(report: DiagnosisReport) -> list[Recommendation]:
     return out
 
 
-def _chosen_recommendation(report: DiagnosisReport) -> Optional[Recommendation]:
-    """The single fix a developer should apply first (drives ``dominant_action``)."""
-    scored = _scored_recommendations(report)
-    return scored[0] if scored else None
-
-
 # --------------------------------------------------------------------------- #
 # Streaming accumulator (O(clusters) memory, not O(traces))
 # --------------------------------------------------------------------------- #
