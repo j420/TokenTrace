@@ -36,9 +36,18 @@ jobs:
       # which is the failure we care about; but the file also contains a legitimate
       # conditional skip, so grepping for the word "skipped" would fail a healthy
       # run. Requiring at least one PASS distinguishes the two.
+      #
+      # Two traps this step has actually fallen into, both fixed here:
+      # * `-o addopts=''` — pyproject sets addopts="-q", so a bare `pytest -q` runs
+      #   double-quiet and SUPPRESSES the "N passed" summary the grep needs. The
+      #   first run of this guard failed a 13/13-green suite exactly that way.
+      # * `set -o pipefail` — without it, `pytest | tee` exits with tee's 0, so a
+      #   run with failures still reaches the grep, and "1 failed, 12 passed"
+      #   MATCHES it. The guard could fail green runs and pass failing ones.
       - name: Assert the Streamlit tests actually ran
         run: |
-          pytest tests/test_app.py -q 2>&1 | tee /tmp/app.log
+          set -o pipefail
+          pytest tests/test_app.py -o addopts='' -q 2>&1 | tee /tmp/app.log
           grep -qE '[0-9]+ passed' /tmp/app.log || {
             echo "::error::no app test passed — streamlit missing, so the whole file skipped"
             exit 1
@@ -69,11 +78,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[dev,mechanistic]"
-      # Same pattern as the app job: the file importorskips torch, so "all
-      # skipped" would otherwise look green. Require at least one PASS.
+      # Same pattern as the app guard, with the same two hard-won fixes:
+      # `-o addopts=''` (pyproject's "-q" made this double-quiet, suppressing the
+      # summary line the grep needs — the first run failed 13 GREEN tests), and
+      # `set -o pipefail` (without it tee's 0 masks pytest's exit code, and since
+      # this is the job's ONLY test step, "1 failed, 12 passed" would match the
+      # grep and pass the job with failing tests).
       - name: Backend tests (must RUN, not skip)
         run: |
-          pytest tests/test_hf_backend.py -q 2>&1 | tee /tmp/backend.log
+          set -o pipefail
+          pytest tests/test_hf_backend.py -o addopts='' -q 2>&1 | tee /tmp/backend.log
           grep -qE '[0-9]+ passed' /tmp/backend.log || {
             echo "::error::no backend test passed — torch missing, so the whole file skipped"
             exit 1
