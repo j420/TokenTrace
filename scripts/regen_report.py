@@ -296,13 +296,12 @@ def main() -> int:
     out = {
         "seeds": list(SEEDS),
         "corpus": dataset_summary(dataset),
+        # The standing test (`test_labels_not_recoverable_from_context_shape`) now
+        # builds the SAME four-seed corpus as this probe, so the single figure below
+        # is both the published number and the tested one. A second three-seed probe
+        # used to be printed here to expose the mismatch; the mismatch is gone, and
+        # keeping the extra probe would re-create the confusion it existed to flag.
         "shortcut_probe": shape_shortcut_probe(model, pipeline, dataset),
-        # The standing test (`test_labels_not_recoverable_from_context_shape`) builds
-        # its corpus from THREE seeds, not four, so it bounds a different corpus from
-        # the published figure. Both are printed rather than one being quoted as if
-        # it were the other.
-        "shortcut_probe_test_seeds": shape_shortcut_probe(
-            model, pipeline, build_dataset(model, pipeline, seeds=(0, 1, 2))),
         "ablations": run_ablations(model, dataset=dataset, pipeline=pipeline, seeds=SEEDS),
         # §4.5. Wired in here because it previously was not: the whole section was
         # hand-transcribed, with no regeneration path and nothing pinning it, while
@@ -321,11 +320,8 @@ def main() -> int:
     print(f"by mode: {out['corpus']['by_mode']}\n")
 
     p = out["shortcut_probe"]
-    pt = out["shortcut_probe_test_seeds"]
-    print(f"shape-only shortcut probe, seeds={list(SEEDS)} (published): "
-          f"acc={p['shape_only_accuracy']:.3f} (class prior {p['class_prior']:.3f})")
-    print(f"shape-only shortcut probe, seeds=[0, 1, 2] (what the standing test runs): "
-          f"acc={pt['shape_only_accuracy']:.3f} (class prior {pt['class_prior']:.3f})\n")
+    print(f"shape-only shortcut probe, seeds={list(SEEDS)} (published AND tested): "
+          f"acc={p['shape_only_accuracy']:.3f} (class prior {p['class_prior']:.3f})\n")
 
     hdr = f"{'tier':6s} {'diag':>6s} {'top3':>6s} {'cov':>6s} {'set':>5s} " \
           f"{'recP':>6s} {'recN':>5s} {'neg':>4s} {'healthy':>8s} {'declined':>9s} {'dbg':>6s}"

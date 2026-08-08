@@ -1,14 +1,16 @@
 """NNsight mechanistic-capture backend.
 
 NNsight traces arbitrary HuggingFace models and, unlike plain forward hooks, makes
-*interventions* first-class — so this backend is the rung of the fallback ladder we
-reach for when we want true **activation patching** for ``gold_patch_effect`` (the
-causal white-box signal), and it covers models TransformerLens does not yet support.
+*interventions* first-class — so this is the backend to pick (explicitly, via
+``registry.load_model(backend="nnsight")``; there is no automatic backend-to-backend
+fallback) when you want true **activation patching** for ``gold_patch_effect`` (the
+causal white-box signal). ``models/hf.py`` is the sibling capture backend built on
+``transformers`` built-ins alone; the only automatic degradation is the TIER ladder
+(white -> grey -> black) driven by ``ModelProfile.max_tier``.
 
-Fallback ladder (see ModelProfile.max_tier):
-    HookedTransformer -> TransformerBridge -> **NNsight** -> raw HF hooks (models/hf.py) -> grey-box
-
-Grey-box capture (attention-to-context/gold, logit-lens, ReDeEP scores) mirrors the
+Grey-box capture (attention-to-context/gold, logit-lens, decoupled ReDeEP-lite
+external/parametric scores — same definitions as the HF backend, see
+:meth:`HFModel._external_copy_score` / :meth:`HFModel._ffn_share`) mirrors the
 HF backend; white-box adds an activation-patching pass that zeroes the gold-chunk
 positions in the layer-0 residual stream and measures the drop in the answer-token
 log-prob.
@@ -61,6 +63,8 @@ class NNsightModel(ModelHandle):
     _NORM_PATHS = ("model.norm", "model.language_model.norm",
                    "model.decoder.final_layer_norm", "transformer.ln_f")
     _HEAD_PATHS = ("lm_head", "language_model.lm_head", "model.lm_head")
+    _EMBED_PATHS = ("model.embed_tokens", "model.language_model.embed_tokens",
+                    "model.decoder.embed_tokens", "transformer.wte")
 
     def __init__(
         self,
@@ -178,6 +182,9 @@ class NNsightModel(ModelHandle):
             # Slice inside the trace so only the scored rows are retained.
             logits_save = head.output[0, start - 1:].save()
         logits = getattr(logits_save, "value", logits_save)
+        if hasattr(logits, "detach"):
+            # nnsight saves carry requires_grad; float() on them warns.
+            logits = logits.detach()
         texts, logprobs, entropies = [], [], []
         for k, tok in enumerate(ids[start:]):
             logp = torch.log_softmax(logits[k].float(), dim=-1)
@@ -235,47 +242,99 @@ class NNsightModel(ModelHandle):
         head = self._resolve(self._HEAD_PATHS)
         n = len(layers)
 
+        import torch
+
+        embed = self._resolve(self._EMBED_PATHS)
+        lens_ok = norm is not None and head is not None
+
         # Declared OUTSIDE the trace: names bound inside the `with` body are not
         # reliably readable afterwards on nnsight >= 0.4.
         attn_saves: list = []
-        lens_tok_saves: list = []
+        out_logit_saves: list = []   # lens logits at each layer's OUTPUT residual
+        mid_logit_saves: list = []   # lens logits at the post-attention residual
+        in0_logit_save = None        # lens logits at layer 0's input (embeddings)
+        content_save = None          # final-norm output: [1, S, D] token content
         with self.lm.trace(inference.prompt):
             # SINGLE forward-order pass: grab everything a layer needs while we are
             # visiting it. Two passes over `layers` make the second one request a
             # one-shot hook that has already fired and self-removed ->
-            # MissedProviderError, which aborts the whole pipeline.
+            # MissedProviderError, which aborts the whole pipeline. Within a layer,
+            # requests are also made in forward order: self_attn -> FFN -> layer out.
+            if lens_ok and embed is not None:
+                # Layer 0's input residual (for Gemma-style scaled embeddings this
+                # is off by the embed scale — only layer 0's attention-gain term is
+                # affected; _ffn_share drops it entirely when embed is missing).
+                in0_logit_save = head(norm(self._hidden(embed.output)[0, last])).save()
             for layer in layers:
                 attn_saves.append(layer.self_attn.output[1].save())  # (attn_out, weights)
-                if norm is not None and head is not None:
-                    # logit-lens INSIDE the trace: project each layer's (normed)
-                    # residual. Envoy modules only execute in a trace context.
-                    hpos = self._hidden(layer.output)[0, last]
-                    lens_tok_saves.append(head(norm(hpos)).argmax(dim=-1).save())
+                if lens_ok:
+                    # The module whose output is the FFN residual contribution
+                    # (Gemma-style layers norm the MLP output before adding it).
+                    ffn = next((getattr(layer, a, None) for a in HFModel._FFN_TAP_ATTRS
+                                if getattr(layer, a, None) is not None), None)
+                    m = ffn.output[0, last] if ffn is not None else None
+                    # logit-lens INSIDE the trace: project the (final-normed)
+                    # residuals. Envoy modules only execute in a trace context.
+                    x_out = self._hidden(layer.output)[0, last]
+                    mid_logit_saves.append(
+                        head(norm(x_out - m)).save() if m is not None else None)
+                    out_logit_saves.append(head(norm(x_out)).save())
+            if norm is not None:
+                # Fires after all layers (forward order): the final-normed states
+                # for every position — the token content the copy score compares.
+                content_save = norm.output.save()
 
-        attentions = [getattr(a, "value", a) for a in attn_saves]
-        lens_tokens = [int(getattr(t, "value", t)) for t in lens_tok_saves]
+        def _val(save):
+            if save is None:
+                return None
+            v = getattr(save, "value", save)
+            return v.detach() if hasattr(v, "detach") else v
 
-        attn_to = HFModel._attention_mass(attentions, last, ctx_pos,
-                                          self.profile.retrieval_heads or None)
-        gold_attn = (HFModel._attention_mass(attentions, last, gold_pos,
-                                             self.profile.retrieval_heads or None)
+        # .detach(): nnsight saves carry requires_grad, and float(tensor) on such
+        # values warns (and would break under a future torch).
+        attentions = [_val(a) for a in attn_saves]
+        out_logits = [_val(s) for s in out_logit_saves]
+        mid_logits = [_val(s) for s in mid_logit_saves]
+
+        heads_sel = self.profile.retrieval_heads or None
+        attn_to = HFModel._attention_mass(attentions, last, ctx_pos, heads_sel)
+        gold_attn = (HFModel._attention_mass(attentions, last, gold_pos, heads_sel)
                      if gold_pos else None)
-        if lens_tokens:
+
+        answer_layer, stability, parametric = None, None, None
+        if out_logits and all(v is not None for v in out_logits):
             # The final layer's normed residual through lm_head IS the model's own
             # next-token distribution, so its argmax is the answer token. Reading it
-            # from `lens_tokens[-1]` avoids also requesting `lm_head.output`, which
+            # from `out_logits[-1]` avoids also requesting `lm_head.output`, which
             # the manual per-layer head() calls above would otherwise race to
             # provide. Same reference the HF backend's lens uses (hidden[-1]).
-            answer_layer, stability = self._lens_stats(lens_tokens, lens_tokens[-1], n)
-        else:
-            # No norm/head found for this architecture -> abstain instead of
-            # reporting an unnormalised lens as a present feature.
-            answer_layer, stability = None, None
-        external = attn_to
-        # NOTE (documented limitation, mirrors models/hf.py): `parametric` is a
-        # deterministic function of `external`, so the two ReDeEP anchors are not
-        # independent measurements on this backend.
-        parametric = min(1.0, max(0.0, 1.0 - external) * (1.0 - (answer_layer or 0.5)) * 2)
+            answer_tok = int(out_logits[-1].argmax())
+            lens_tokens = [int(v.argmax()) for v in out_logits]
+            answer_layer, stability = self._lens_stats(lens_tokens, answer_tok, n)
+            if all(v is not None for v in mid_logits):
+                # Decoupled ReDeEP-lite parametric score: share of the emitted
+                # token's logit-lens promotion done by FFN sublayers (formula
+                # shared with the HF backend via HFModel._ffn_share).
+                def lp(vec):
+                    if vec is None:
+                        return None
+                    return float(torch.log_softmax(vec.float(), dim=-1)[answer_tok])
+
+                lp_out = [lp(v) for v in out_logits]
+                lp_mid = [lp(v) for v in mid_logits]
+                lp_in = [lp(_val(in0_logit_save))] + lp_out[:-1]
+                parametric = HFModel._ffn_share(lp_in, lp_mid, lp_out)
+        # else: no norm/head found for this architecture -> abstain instead of
+        # reporting an unnormalised lens as a present feature.
+
+        # Decoupled ReDeEP-lite external score (definition shared with the HF
+        # backend): attention mass x copy alignment — NOT the raw attention mass,
+        # so it does not alias context_attention_ratio. Abstains without the
+        # final-norm content states rather than silently re-aliasing to attn_to.
+        content = _val(content_save)
+        external = (HFModel._external_copy_score(attentions, content[0], last,
+                                                 ctx_pos, heads_sel)
+                    if content is not None else None)
 
         result = CaptureResult(
             n_layers=n,
@@ -283,8 +342,8 @@ class NNsightModel(ModelHandle):
             gold_attention_ratio=round(gold_attn, 3) if gold_attn is not None else None,
             logit_lens_answer_layer=answer_layer,
             logit_lens_stability=stability,
-            external_context_score=round(external, 3),
-            parametric_knowledge_score=round(parametric, 3),
+            external_context_score=round(external, 3) if external is not None else None,
+            parametric_knowledge_score=round(parametric, 3) if parametric is not None else None,
         )
         if self.supports(Tier.WHITE) and gold_pos:
             result.gold_patch_effect = self._patch_gold(inference, gold_pos)
@@ -323,4 +382,11 @@ class NNsightModel(ModelHandle):
             # _hidden(): indexing [0] first would zero a slice of the BATCH dim.
             self._hidden(layers[0].output)[:, gold_pos, :] = 0
             ablated = head.output[0, -1].log_softmax(dim=-1)[tgt].save()
-        return round(float(getattr(clean, "value", clean)) - float(getattr(ablated, "value", ablated)), 3)
+
+        def _scalar(save):
+            v = getattr(save, "value", save)
+            # detach: nnsight saves carry requires_grad, and float() on such
+            # tensors warns (and would break under a future torch).
+            return float(v.detach() if hasattr(v, "detach") else v)
+
+        return round(_scalar(clean) - _scalar(ablated), 3)
