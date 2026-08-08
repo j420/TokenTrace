@@ -282,32 +282,61 @@ def test_transfer_and_retrained_are_genuinely_different_runs(noref_result):
     """(a) and (b) must not be the same experiment relabelled.
 
     They share the stripped test set, so the difference has to come from the
-    engine: the shipped one is fitted on reference-bearing data and has no
-    no-reference calibration map at all, while the refit one does.
+    engine. REWRITTEN with the |noref calibration fix: this test used to assert
+    that the shipped engine has NO no-reference calibration map — which was the
+    §4.5.1 bug being pinned as a property. `train_engine` now fits calibration
+    from the cal rows AND their reference-stripped twins by default
+    (`fit_noref=True`), so the shipped engine legitimately carries |noref maps.
+    What still separates (a) from (b): the shipped engine is calibrated on BOTH
+    populations (reference-bearing and stripped), while the refit engine's cal
+    split is all-stripped, so it can have no reference-bearing map at all — and
+    its heads were fitted on stripped features.
     """
     r = noref_result
     transfer_maps = r["calibration_path"]["transfer"]["signatures_with_a_fitted_map"]
     retrained_maps = r["calibration_path"]["retrained"]["signatures_with_a_fitted_map"]
 
-    def has_noref(maps):
-        return any(s.endswith("|noref") or s == "__noref__" for s in maps)
+    def noref_sigs(maps):
+        return [s for s in maps if s.endswith("|noref") or s == "__noref__"]
 
-    assert not has_noref(transfer_maps), \
-        "the shipped engine is calibrated on reference-bearing data only"
-    assert has_noref(retrained_maps), \
+    def ref_sigs(maps):
+        # __global__ is pooled over both populations, so it names neither.
+        return [s for s in maps
+                if s != "__global__" and not (s.endswith("|noref") or s == "__noref__")]
+
+    # Changed from `not has_noref(transfer_maps)`: the shipped engine now fits
+    # real |noref maps (mutation check: drop the stripped pass in train_engine
+    # and this goes red).
+    assert noref_sigs(transfer_maps), \
+        "the shipped engine must fit |noref calibration maps (fit_noref default)"
+    assert ref_sigs(transfer_maps), \
+        "the shipped engine is still calibrated on reference-bearing data too"
+    assert noref_sigs(retrained_maps), \
         "the refit engine must fit a no-reference calibration map"
+    assert ref_sigs(retrained_maps) == [], \
+        "the refit engine never saw a reference-bearing record, so it cannot " \
+        "have a reference-bearing map"
     assert transfer_maps != retrained_maps
     assert r["confusion"]["transfer"] != r["confusion"]["retrained"]
     assert r["delta_vs_baseline"]["transfer"] != r["delta_vs_baseline"]["retrained"]
 
 
-def test_stripped_traces_are_never_served_their_own_calibration_map(noref_result):
-    """Reports the calibration path rather than assuming it.
+def test_stripped_traces_are_served_real_noref_calibration_maps(noref_result):
+    """REWRITTEN: this test used to pin the *finding* ("no |noref map exists, so
+    no stripped trace can be served an exact-signature map"). The fix it
+    anticipated has landed — ``train_engine`` fits calibration from
+    reference-stripped passes by default — so the honest property inverts:
 
-    Every stripped trace selects a ``|noref`` signature, and no map was fitted for
-    one, so not a single probability can come from an exact-signature map. Where
-    it lands instead (pooled global vs raw sigmoid) is left unpinned so the
-    finding can be *fixed* without breaking this test.
+    a stripped trace is served an exact or coarse |noref map (fallback level 0
+    or 1, both fitted from reference-free records only), and is NEVER served the
+    reference-only pooled map without admission. A mode whose |noref buckets
+    failed the beats-the-sigmoid adoption bar may still legitimately fall to the
+    (now admitted, genuinely mixed) __global__ pool or the raw sigmoid — that is
+    the validation gate working, not the old bug — so what is pinned is that the
+    noref-fitted maps exist, clear the data-sufficiency bar, and actually serve.
+
+    Mutation check: reverting `fit_noref` (dropping the stripped calibration
+    pass in train_engine) turns every assertion about noref maps below red.
     """
     r = noref_result
     transfer = r["calibration_path"]["transfer"]
@@ -316,11 +345,35 @@ def test_stripped_traces_are_never_served_their_own_calibration_map(noref_result
     assert transfer["observed_signatures"], "no traces observed"
     assert all(s.endswith("|noref") for s in transfer["observed_signatures"])
     assert not any(s.endswith("|noref") for s in baseline["observed_signatures"])
-    assert transfer["fallback_levels"].get("exact_signature", 0) == 0
-    # the reference-bearing baseline IS served exact maps — so the assertion above
-    # is measuring the missing reference, not a broken calibrator
+
+    # The coarse __noref__ bucket clears Calibrator.min_samples (40): one stripped
+    # pass per cal row per tier is hundreds of records on two seeds.
+    assert transfer["n_noref_calibration_records"] >= 40
+    assert transfer["global_pool_admits_noref"] is True
+
+    # The served count must BE the sum of the level-0/1 noref tallies, not a
+    # separately-maintained number: adversarial verification inflated it with
+    # level-2 (pooled) fallbacks — 35 became 160 — and nothing went red. The
+    # tallies and the count are reported side by side precisely so they can be
+    # cross-checked; do it here rather than leaving it to the reader.
+    tallies = transfer["fallback_levels_noref_rows_only"]
+    assert transfer["noref_rows_served_by_noref_fitted_maps"] == (
+        tallies.get("exact_signature", 0) + tallies.get("coarse_ref_or_noref", 0))
+
+    # Real |noref maps were fitted AND serve stripped traces (levels 0/1).
+    assert any(s.endswith("|noref") or s == "__noref__"
+               for s in transfer["signatures_with_a_fitted_map"])
+    assert transfer["noref_rows_served_by_noref_fitted_maps"] > 0
+
+    # Never the reference-only pool without admission — the §4.5.1 bug.
+    assert transfer["noref_served_by_pooled_map"] is False
+
+    # the reference-bearing baseline is still served reference-fitted maps — so
+    # none of the above is a symptom of the calibrator having collapsed the two
+    # populations into one
     assert baseline["fallback_levels"].get("exact_signature", 0) > 0 or \
         baseline["fallback_levels"].get("coarse_ref_or_noref", 0) > 0
+    assert baseline["fallback_levels_noref_rows_only"] == {}
 
 
 def test_retrieval_vs_dilution_prediction_is_reported_either_way(noref_result):
