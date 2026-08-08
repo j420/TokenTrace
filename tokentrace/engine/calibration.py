@@ -13,6 +13,7 @@ import math
 import pickle
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 from tokentrace.core.types import FailureMode
 
@@ -129,33 +130,36 @@ class Calibrator:
         self.maps = {}
         self.n_noref = 0
 
-        groups: dict[tuple[str, str], list[tuple[float, int]]] = defaultdict(list)
+        groups: dict[tuple[str, str], list[tuple[float, int, bool]]] = defaultdict(list)
         for r in records:
             mode = r["mode"].value if isinstance(r["mode"], FailureMode) else str(r["mode"])
             sig = r["signature"]
-            groups[(mode, sig)].append((r["z"], int(r["label"])))
+            noref = sig.endswith("|noref")
+            entry = (r["z"], int(r["label"]), noref)
+            groups[(mode, sig)].append(entry)
             # Intermediate bucket so a thin signature degrades one STEP (to traces
             # with the same reference-availability) rather than straight to a fully
             # pooled map — the pooling this module exists to avoid.
-            groups[(mode, _coarse(sig))].append((r["z"], int(r["label"])))
-            groups[(mode, "__global__")].append((r["z"], int(r["label"])))
-            if sig.endswith("|noref"):
+            groups[(mode, _coarse(sig))].append(entry)
+            groups[(mode, "__global__")].append(entry)
+            if noref:
                 self.n_noref += 1
 
-        for key, pairs in groups.items():
-            if len(pairs) < self.min_samples:
+        for key, rows in groups.items():
+            if len(rows) < self.min_samples:
                 continue
-            ys = [y for _, y in pairs]
+            ys = [y for _, y, _ in rows]
             if len(set(ys)) < 2:
                 continue
-            zs = [z for z, _ in pairs]
-            fitted = self._fit_validated(zs, ys)
+            zs = [z for z, _, _ in rows]
+            fitted = self._fit_validated(zs, ys, [p for _, _, p in rows])
             if fitted is not None:
                 self.maps[key] = fitted
         return self
 
     # ------------------------------------------------------------------ #
-    def _fit_validated(self, zs: list[float], ys: list[int]):
+    def _fit_validated(self, zs: list[float], ys: list[int],
+                       noref_flags: Optional[list[bool]] = None):
         """Fit a calibration map and KEEP IT ONLY IF IT BEATS THE RAW SIGMOID.
 
         Calibration is not free: when the underlying scores are already sharp and
@@ -168,6 +172,21 @@ class Calibrator:
         Brier score against the identity (raw sigmoid) baseline, and only adopt the
         map when it actually helps. Isotonic is tried on large buckets and Platt on
         thin ones (a non-parametric fit overfits when data is scarce).
+
+        ``noref_flags`` marks each record's reference-availability population. A
+        single-population bucket (every exact-signature bucket, ``__ref__``,
+        ``__noref__``) is validated exactly as before. A MIXED bucket —
+        ``__global__`` once reference-stripped calibration passes exist — is served
+        to one population at a time, so beating the sigmoid on the mixed holdout is
+        not enough: a map can model the population *contrast* rather than
+        calibration, win the pooled comparison, and still make one population's
+        probabilities worse. Measured, not hypothetical: under observation noise
+        0.75 the mixed ``__global__`` map was adopted on the pooled holdout and
+        pushed reference-bearing ECE to 0.0683 against a 0.0077 raw sigmoid. The
+        extra gate rejects the candidate if it is worse than the sigmoid on the
+        holdout slice of any population that meaningfully shaped the bucket — with
+        "meaningfully" being ``min_samples``, the same data-sufficiency bar used
+        everywhere else, not a new constant.
         """
         from sklearn.isotonic import IsotonicRegression
 
@@ -191,8 +210,22 @@ class Calibrator:
             cand.fit(tr_z, tr_y)
         else:
             cand = _Platt().fit(tr_z, tr_y)
-        if brier(list(cand.predict(va_z)), va_y) >= baseline:
+        cand_preds = list(cand.predict(va_z))
+        if brier(cand_preds, va_y) >= baseline:
             return None   # calibration does not help here; keep the raw sigmoid
+
+        if noref_flags is not None and len(set(noref_flags)) > 1:
+            va_p = [noref_flags[i] for i in range(n) if i in hold]
+            base_preds = [sigmoid(z) for z in va_z]
+            for pop in (False, True):
+                if sum(1 for p in noref_flags if p == pop) < self.min_samples:
+                    continue      # this population did not meaningfully shape the bucket
+                sl = [i for i, p in enumerate(va_p) if p == pop]
+                if not sl:
+                    continue
+                if brier([cand_preds[i] for i in sl], [va_y[i] for i in sl]) > \
+                        brier([base_preds[i] for i in sl], [va_y[i] for i in sl]):
+                    return None   # helps the pool, hurts this population: reject
 
         # Adopted: refit on the full bucket now that the family is validated.
         if n >= self.isotonic_min:

@@ -148,6 +148,31 @@ RULES: list[Rule] = [
                     f"answer formed early from parametric memory "
                     f"(param {g(f,'parametric_knowledge_score'):.2f}, layer "
                     f"{g(f,'logit_lens_answer_layer'):.2f}) — parametric override")),
+    # WHITE-exclusive causal confirmation of the override. The gold chunk was
+    # retrieved AND attended AND the answer is wrong, yet input-ablating the gold
+    # tokens barely moves the answer (LOW gold_patch_effect): the model was not
+    # actually USING the context, so the wrong answer came from parametric memory.
+    # Direction fixed by measurement on the mock corpus, not by intuition: patch
+    # effect is LOW for override (0.05) — and ALSO low for dilution (a diluted
+    # model is not using the gold either), so the attention + parametric terms
+    # carry the override-vs-dilution split while the patch term supplies the
+    # causal, white-only confirmation (it separates override from grounded ~0.8
+    # and ambiguous ~0.3 traces, where the context IS causally read).
+    # ``required`` includes gold_patch_effect, so this rule ABSTAINS below WHITE —
+    # that abstention is the tier-degradation mechanism that makes white vs grey
+    # distinct experiments (they were previously bit-identical).
+    Rule("hal.override_causal", M.HALLUCINATION,
+         ("gold_recall_in_context", "gold_attention_ratio", "parametric_knowledge_score",
+          "is_correct", "gold_patch_effect"), 1.6, SignalFamily.MECHANISTIC,
+         lambda f: up(g(f, "gold_recall_in_context"), 0.5, 0.9)
+                   * up(g(f, "gold_attention_ratio"), 0.25, 0.45)
+                   * up(g(f, "parametric_knowledge_score"), 0.55, 0.8)
+                   * down(g(f, "is_correct"), 0.5, 1.0)
+                   * down(g(f, "gold_patch_effect"), 0.15, 0.45),
+         lambda f: (f"ablating the attended gold chunk barely changes the answer "
+                    f"(patch effect {g(f,'gold_patch_effect'):.2f} with attention "
+                    f"{g(f,'gold_attention_ratio'):.2f}) — causal evidence the wrong "
+                    f"answer is parametric, not context-driven")),
     # Non-RAG confabulation: hallucination must be diagnosable with NO retrieval
     # signals at all (all other hallucination rules require answer_supported_by_context,
     # which only exists for RAG inputs, so cold-start called every non-RAG

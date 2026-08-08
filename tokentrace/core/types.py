@@ -334,7 +334,7 @@ class ModelProfile:
     n_layers: int = 0
     n_heads: int = 0
     d_model: int = 0
-    max_tier: Tier = Tier.WHITE           # cap if TransformerLens/hooks unsupported
+    max_tier: Tier = Tier.WHITE           # cap if grey/white capture unsupported
     tokenizer_quirks: dict[str, Any] = field(default_factory=dict)
     lost_in_middle_baseline: Optional[list[float]] = None   # expected recall vs position
     retrieval_heads: list[tuple[int, int]] = field(default_factory=list)  # (layer, head)
