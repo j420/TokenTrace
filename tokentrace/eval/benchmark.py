@@ -9,10 +9,12 @@ whole thing runs with no downloads.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 from typing import Optional
 
 from tokentrace.core.types import ALL_MODES, LabeledInference, Tier
+from tokentrace.data.strip import strip_inference
 from tokentrace.data.synthetic import featurize
 from tokentrace.engine.calibration import Calibrator
 from tokentrace.engine.classifier import ResidualClassifier
@@ -37,6 +39,23 @@ def split_dataset(
     return keyed[:a], keyed[a:b], keyed[b:]
 
 
+def family_dropout_schedule(n: int) -> list[Tier]:
+    """The per-row tier schedule behind every published number.
+
+    ``[WHITE, GREY, BLACK]`` cycled over the training rows — the family-dropout
+    regularizer that hardens the learned heads against missing signal families.
+    One definition, used by ``train_and_evaluate`` here, by
+    ``TokenTrace.default()`` (the engine users actually run), and by
+    ``eval/noref.run_noref``; ``eval/ablations.py`` spells out the same cycle.
+    Those entry points previously trained differently while the docs presented
+    their tables as interchangeable, which is exactly the drift this helper
+    removes: the shipped engine and the benchmarked engine must be the same
+    engine.
+    """
+    cycle = [Tier.WHITE, Tier.GREY, Tier.BLACK]
+    return [cycle[i % 3] for i in range(n)]
+
+
 def train_engine(
     train: list[LabeledInference],
     cal: list[LabeledInference],
@@ -44,7 +63,19 @@ def train_engine(
     pipeline: Optional[SignalPipeline] = None,
     train_tiers: Optional[list[Tier]] = None,
     validate_recommendations: bool = True,
+    fit_noref: bool = True,
 ) -> DiagnosisEngine:
+    """Fit heads on ``train``, then calibration + conformal on ``cal``.
+
+    ``fit_noref`` (default on): calibration additionally sees a reference-stripped
+    twin of every cal row — ``ground_truth`` removed, every ``Chunk.gold``
+    cleared, labels unchanged — so genuine ``|noref`` maps get fitted and a
+    production-shape (no-reference) trace is served a map that was actually
+    fitted on traces like it, instead of falling through the
+    ``global_admits_noref`` guard to the raw sigmoid (docs/REPORT.md §4.5.1
+    itemizes what that fallback cost). The escape hatch exists for measuring the
+    old behaviour, not for shipping it.
+    """
     pipeline = pipeline or SignalPipeline()
 
     # 1) fit residual heads on the featurized training set
@@ -63,22 +94,47 @@ def train_engine(
     # against Calibrator.min_samples. Derive the schedule from the handle's real
     # ceiling and de-duplicate the records.
     cal_tiers = [t for t in (Tier.WHITE, Tier.GREY, Tier.BLACK) if t <= model.tier] or [model.tier]
+    # With fit_noref, every cal row also contributes a reference-STRIPPED pass:
+    # same trace, same labels (they come from the injection recipe, not the
+    # reference), but ground_truth=None and no Chunk.gold — the shape a
+    # production trace arrives in. Its features select a `|noref` signature, so
+    # the calibrator fits real |noref maps (exact per-signature where the data
+    # suffices, the coarse `__noref__` bucket otherwise: one stripped pass per
+    # tier per cal row lands every unmasked mode's record in that bucket, which
+    # clears Calibrator.min_samples=40 from ~40 cal rows). Stripping an
+    # already-stripped row reproduces the original records, and the dedup key
+    # below collapses them, so double-counting cannot inflate min_samples.
+    #
+    # The stripped twins are observed through a COPY of the pipeline. A stateful
+    # pipeline (the ablation harness's NoisyPipeline keeps a draw counter, so
+    # every .run() advances its noise stream) must see exactly the observation
+    # stream it saw before this feature existed: routing the extra passes through
+    # the caller's own pipeline re-randomized every subsequent observation — the
+    # original calibration records, the conformal fit and the caller's evaluation
+    # — and turned the fit_noref comparison into a different experiment rather
+    # than the same experiment plus |noref maps. For a stateless pipeline the
+    # copy is a no-op.
+    noref_pipeline = copy.copy(pipeline) if fit_noref else None
     records = []
     seen_rec: set = set()
     for li in cal:
-        for t in cal_tiers:
-            fv = pipeline.run(li.inference, model.with_tier(t))
-            z = engine.raw_logits(fv, li.inference)
-            sig = fv.missingness_signature()
-            yv = dict(zip(ALL_MODES, li.label_vector()))
-            for m in ALL_MODES:
-                if z[m] <= _MASK:            # masked (non-RAG) — nothing to calibrate
-                    continue
-                key = (m.value, sig, round(z[m], 6), yv[m])
-                if key in seen_rec:
-                    continue
-                seen_rec.add(key)
-                records.append({"mode": m, "signature": sig, "z": z[m], "label": yv[m]})
+        variants = [(li.inference, pipeline)]
+        if fit_noref:
+            variants.append((strip_inference(li.inference), noref_pipeline))
+        yv = dict(zip(ALL_MODES, li.label_vector()))
+        for inf, pl in variants:
+            for t in cal_tiers:
+                fv = pl.run(inf, model.with_tier(t))
+                z = engine.raw_logits(fv, inf)
+                sig = fv.missingness_signature()
+                for m in ALL_MODES:
+                    if z[m] <= _MASK:        # masked (non-RAG) — nothing to calibrate
+                        continue
+                    key = (m.value, sig, round(z[m], 6), yv[m])
+                    if key in seen_rec:
+                        continue
+                    seen_rec.add(key)
+                    records.append({"mode": m, "signature": sig, "z": z[m], "label": yv[m]})
     calibrator = Calibrator().fit(records)
     engine.calibrator = calibrator
 
@@ -148,10 +204,7 @@ def train_and_evaluate(
 
     # Family-dropout: train across mixed tiers so the heads are robust to missing
     # families (this is what keeps black-box calibration honest).
-    train_tiers = None
-    if family_dropout:
-        cycle = [Tier.WHITE, Tier.GREY, Tier.BLACK]
-        train_tiers = [cycle[i % 3] for i in range(len(train))]
+    train_tiers = family_dropout_schedule(len(train)) if family_dropout else None
 
     engine = train_engine(train, cal, model, pipeline, train_tiers=train_tiers)
 
